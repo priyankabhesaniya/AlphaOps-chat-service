@@ -1,0 +1,53 @@
+version: "3.8"
+
+services:
+  chat-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chat-service
+    restart: unless-stopped
+    ports:
+      - "3012:3012"
+    environment:
+      - PORT=3012
+      - NODE_ENV=production
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=chat_db
+      - REDIS_URL=${REDIS_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - NOTIFICATION_SERVICE_URL=${NOTIFICATION_SERVICE_URL}
+      - HRMS_SERVICE_URL=${HRMS_SERVICE_URL}
+      - AUTH_DB_HOST=${AUTH_DB_HOST}
+      - AUTH_DB_USER=${AUTH_DB_USER}
+      - AUTH_DB_PASSWORD=${AUTH_DB_PASSWORD}
+      - AUTH_DB_NAME=${AUTH_DB_NAME}
+      - ORG_DB_HOST=${ORG_DB_HOST}
+      - ORG_DB_USER=${ORG_DB_USER}
+      - ORG_DB_PASSWORD=${ORG_DB_PASSWORD}
+      - ORG_DB_NAME=${ORG_DB_NAME}
+    depends_on:
+      - redis
+    networks:
+      - alphaops-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: chat-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - alphaops-network
+
+volumes:
+  redis-data:
+
+networks:
+  alphaops-network:
+    driver: bridge
