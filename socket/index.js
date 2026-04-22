@@ -6,13 +6,7 @@ const { setPresence, removePresence } = require("../redis/cacheService");
 const setupMessageHandler = require("./messageHandler");
 const setupPresenceHandler = require("./presenceHandler");
 const setupReadHandler = require("./readHandler");
-
-// Map: userId → Set<socketId>
-const userSockets = new Map();
-
-function getUserSockets(userId) {
-  return userSockets.get(String(userId)) || new Set();
-}
+const { userSockets, getUserSockets } = require("./userSocketStore");
 
 function initSocket(server) {
   const io = new Server(server, {

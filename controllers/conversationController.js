@@ -9,6 +9,31 @@ const { invalidateParticipants, setParticipantIds, getCachedUsers } = require(".
 const { getAllUnreads, removeConversationUnread } = require("../redis/unreadService");
 const { Op } = require("sequelize");
 const { sequelizeWrite } = require("../config/database");
+const { addMessageFanoutJob } = require("../jobs/queue");
+
+function emitNewMessage(conversationId, message) {
+  try {
+    global._io?.to?.(`conv:${conversationId}`)?.emit?.("message:new", message);
+  } catch (e) {
+    // ignore socket emit failures (API should still succeed)
+  }
+}
+
+async function fanoutSystemMessage({ message, conversation_id, org_id, sender_id, system_action }) {
+  // For system messages, we still want unread counts, conversation last message,
+  // and offline push notifications to work. We pass a preview string via `content`.
+  const preview = system_action ? String(system_action).replace(/_/g, " ") : "system";
+  await addMessageFanoutJob({
+    message_id: message.id,
+    conversation_id,
+    org_id,
+    sender_id,
+    content: preview,
+    kind: message.kind,
+    parent_message_id: null,
+    mentions: [],
+  });
+}
 
 // GET /conversations — list user's conversations
 const getConversations = async (req, res) => {
@@ -350,9 +375,17 @@ const leaveConversation = async (req, res) => {
     await ConversationActivityLog.create({
       conversation_id: id, org_id, actor_id: userId, action: "left",
     });
-    await Message.create({
+    const sysMsg = await Message.create({
       conversation_id: id, org_id, sender_id: userId,
       kind: 3, system_action: "member_left",
+    });
+    emitNewMessage(id, sysMsg.toJSON());
+    await fanoutSystemMessage({
+      message: sysMsg,
+      conversation_id: id,
+      org_id,
+      sender_id: userId,
+      system_action: "member_left",
     });
 
     sendResponse(res, 200, true, "Left conversation");
@@ -410,12 +443,14 @@ const addMembers = async (req, res) => {
       }
     }
 
+    const createdSystemMessages = [];
     // System message + log for each member
     for (const uid of newUserIds) {
-      await Message.create(
+      const sysMsg = await Message.create(
         { conversation_id: id, org_id, sender_id: userId, kind: 3, system_action: "member_added" },
         { transaction: t }
       );
+      createdSystemMessages.push(sysMsg);
       await ConversationActivityLog.create(
         { conversation_id: id, org_id, actor_id: userId, action: "member_added", target_user_id: uid },
         { transaction: t }
@@ -424,6 +459,18 @@ const addMembers = async (req, res) => {
 
     await t.commit();
     await invalidateParticipants(id);
+
+    // Emit to sockets + fanout for unread/notifications
+    for (const msg of createdSystemMessages) {
+      emitNewMessage(id, msg.toJSON());
+      await fanoutSystemMessage({
+        message: msg,
+        conversation_id: id,
+        org_id,
+        sender_id: userId,
+        system_action: "member_added",
+      });
+    }
 
     sendResponse(res, 200, true, "Members added", { added: newUserIds });
   } catch (error) {
@@ -458,8 +505,16 @@ const removeMember = async (req, res) => {
     await ConversationActivityLog.create({
       conversation_id: id, org_id, actor_id: actorId, action: "member_removed", target_user_id: targetUserId,
     });
-    await Message.create({
+    const sysMsg = await Message.create({
       conversation_id: id, org_id, sender_id: actorId, kind: 3, system_action: "member_removed",
+    });
+    emitNewMessage(id, sysMsg.toJSON());
+    await fanoutSystemMessage({
+      message: sysMsg,
+      conversation_id: id,
+      org_id,
+      sender_id: actorId,
+      system_action: "member_removed",
     });
 
     sendResponse(res, 200, true, "Member removed");

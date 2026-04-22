@@ -1,6 +1,7 @@
 const { Message, ConversationParticipant, MessageReaction, MessageEdit, MessageDeletion } = require("../models");
 const { getIdempotencyKey, setIdempotencyKey, getParticipantIds, checkRateLimit } = require("../redis/cacheService");
 const { addMessageFanoutJob } = require("../jobs/queue");
+const processMessageFanout = require("../jobs/messageFanout");
 
 const MESSAGE_KIND = { TEXT: 1, FILE: 2, SYSTEM: 3 };
 
@@ -84,7 +85,7 @@ function setupMessageHandler(io, socket) {
       io.to(`conv:${conversation_id}`).emit("message:new", msgData);
 
       // Enqueue async fan-out (unread, notifications, conversation update, search)
-      await addMessageFanoutJob({
+      const fanoutPayload = {
         message_id: message.id,
         conversation_id,
         org_id: orgId,
@@ -93,7 +94,13 @@ function setupMessageHandler(io, socket) {
         kind,
         parent_message_id: parent_message_id || null,
         mentions: mentions || [],
-      });
+      };
+
+      const queuedJob = await addMessageFanoutJob(fanoutPayload);
+      // Redis/Bull can be unavailable locally; fallback to direct execution so unread/push still work.
+      if (!queuedJob) {
+        await processMessageFanout({ data: fanoutPayload });
+      }
     } catch (error) {
       console.error("message:send error:", error.message);
       ack?.({ error: "Failed to send message" });

@@ -1,7 +1,8 @@
 const { Conversation, ConversationParticipant, Message, MessageMention, MessageSearchIndex } = require("../models");
-const { getParticipantIds } = require("../redis/cacheService");
-const { incrementUnreadBulk } = require("../redis/unreadService");
-const { userSockets } = require("../socket/index");
+const { getParticipantIds, getCachedUser } = require("../redis/cacheService");
+const { incrementUnreadBulk, isConnected: redisConnected } = require("../redis/unreadService");
+const { userSockets } = require("../socket/userSocketStore");
+const { isConnected } = require("../redis/client");
 const axios = require("axios");
 
 const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL || "http://localhost:3008";
@@ -21,6 +22,7 @@ const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL || "http:/
  * 8. Send FCM push to offline participants
  * 9. Emit conversation:updated to all participants
  */
+
 async function processMessageFanout(job) {
   const {
     message_id,
@@ -47,9 +49,32 @@ async function processMessageFanout(job) {
   // Exclude sender from unread recipients
   const recipients = participantIds.filter((id) => Number(id) !== Number(sender_id));
 
-  // 2. Increment unread counts in Redis (bulk pipeline)
+  // Resolve sender name for notification payload (best-effort from Redis cache)
+  let senderName = null;
+  try {
+    const senderUser = await getCachedUser(sender_id);
+    if (senderUser) {
+      senderName = senderUser.name || senderUser.full_name || senderUser.first_name || null;
+    }
+  } catch (_) { /* non-critical */ }
+
+  // 2. Increment unread counts in Redis (bulk pipeline).
+  // Falls back to direct DB increment when Redis is unavailable so counts
+  // are always updated regardless of Redis availability.
   if (recipients.length > 0) {
-    await incrementUnreadBulk(recipients, conversation_id);
+    if (isConnected()) {
+      await incrementUnreadBulk(recipients, conversation_id);
+    } else {
+      // Redis down — write directly to DB
+      try {
+        await ConversationParticipant.increment("unread_count", {
+          by: 1,
+          where: { conversation_id, user_id: recipients, is_active: 1 },
+        });
+      } catch (err) {
+        console.error("[fanout] DB unread increment failed:", err.message);
+      }
+    }
   }
 
   // 3. Emit unread:update to connected recipients
@@ -113,37 +138,43 @@ async function processMessageFanout(job) {
     });
   }
 
-  // 8. FCM push to offline participants via notification-service
-  const offlineUserIds = recipients.filter((uid) => {
-    const sockets = userSockets.get(String(uid));
-    return !sockets || sockets.size === 0;
-  });
+  // 8. Push notifications via notification-service.
+  // Send to recipients regardless of online status so browser FCM tests work consistently.
+  const notifyCandidateUserIds = recipients;
 
-  if (offlineUserIds.length > 0) {
+  if (notifyCandidateUserIds.length > 0) {
     try {
       // Check muted participants
       const mutedRows = await ConversationParticipant.findAll({
-        where: { conversation_id, user_id: offlineUserIds, is_muted: 1, is_active: 1 },
+        where: { conversation_id, user_id: notifyCandidateUserIds, is_muted: 1, is_active: 1 },
         attributes: ["user_id"],
         raw: true,
       });
       const mutedSet = new Set(mutedRows.map((r) => r.user_id));
-      const notifyUserIds = offlineUserIds.filter((uid) => !mutedSet.has(uid));
+      const notifyUserIds = notifyCandidateUserIds.filter((uid) => !mutedSet.has(uid));
 
       if (notifyUserIds.length > 0) {
-        await axios.post(
-          `${NOTIFICATION_SERVICE_URL}/send-batch`,
-          {
-            userIds: notifyUserIds,
-            orgId: org_id,
-            type: "chat_message",
-            data: { conversation_id, message_id },
-            body: preview || "Sent a file",
-          },
-          { timeout: 5000 }
-        ).catch((err) => {
-          console.error("FCM batch push failed:", err.message);
-        });
+        const notification = {
+          type: "chat_message",
+          message: preview || (kind === 2 ? "Sent a file" : "New message"),
+          sender_name: senderName || "Someone",
+          sender_id: String(sender_id),
+          data: JSON.stringify({ conversation_id, message_id }),
+          timestamp: new Date().toISOString(),
+        };
+
+        await axios
+          .post(
+            `${NOTIFICATION_SERVICE_URL}/notifications/send`,
+            {
+              userIds: notifyUserIds,
+              notification,
+            },
+            { timeout: 5000 }
+          )
+          .catch((err) => {
+            console.error("Notification-service send failed:", err.message);
+          });
       }
     } catch (err) {
       console.error("Notification check failed:", err.message);

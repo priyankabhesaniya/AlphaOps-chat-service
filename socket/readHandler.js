@@ -12,25 +12,37 @@ function setupReadHandler(io, socket) {
         return ack?.({ error: "conversation_id and message_id required" });
       }
 
-      // Reset unread in Redis (instant)
+      // Guard: message_id must be a valid integer (not a client temp UUID)
+      const messageIdInt = parseInt(message_id, 10);
+      const isValidMessageId = !isNaN(messageIdInt) && messageIdInt > 0 && String(messageIdInt) === String(message_id).trim();
+
+      // Reset unread in Redis (instant) — always safe
       await resetUnread(userId, conversation_id);
 
-      // Update DB watermark
-      await ConversationParticipant.update(
-        {
-          last_read_message_id: message_id,
-          last_read_at: new Date(),
-          unread_count: 0,
-        },
-        {
-          where: {
-            conversation_id,
-            user_id: userId,
-            org_id: orgId,
-            is_active: 1,
+      // Only update DB watermark when we have a real server-assigned integer ID
+      if (isValidMessageId) {
+        await ConversationParticipant.update(
+          {
+            last_read_message_id: messageIdInt,
+            last_read_at: new Date(),
+            unread_count: 0,
           },
-        }
-      );
+          {
+            where: {
+              conversation_id,
+              user_id: userId,
+              org_id: orgId,
+              is_active: 1,
+            },
+          }
+        );
+      } else {
+        // Temp ID — still clear unread_count column but skip the invalid message ID
+        await ConversationParticipant.update(
+          { last_read_at: new Date(), unread_count: 0 },
+          { where: { conversation_id, user_id: userId, org_id: orgId, is_active: 1 } }
+        );
+      }
 
       ack?.({ success: true });
 
