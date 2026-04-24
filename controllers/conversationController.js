@@ -121,17 +121,20 @@ const getConversations = async (req, res) => {
       const conv = p.conversation.toJSON();
       const participantCount = countMap[conv.id] || 0;
 
-      // For DMs, set title to other user's name
+      // For DMs, set title and avatar_url to the other user's info
       let title = conv.title;
+      let avatarUrl = conv.avatar_url;
       if (conv.type === 1) {
         const otherUserId = dmOtherUserMap[conv.id];
         const otherUser = otherUserId ? userMap[otherUserId] : null;
         title = otherUser?.name || `User ${otherUserId || ""}`;
+        avatarUrl = otherUser?.avatar_url || null;
       }
 
       return {
         ...conv,
         title,
+        avatar_url: avatarUrl,
         role: p.role,
         is_favorite: p.is_favorite,
         is_muted: p.is_muted,

@@ -37,6 +37,10 @@ app.get("/health", (req, res) => {
 // Routes
 app.use("/conversations", conversationRoutes);
 app.use("/conversations", messageRoutes);
+// Also expose message-level routes (pin/star) at root so
+// /messages/:id/pin and /messages/:id/star resolve correctly
+// when the API gateway strips the /conversations prefix.
+app.use("/", messageRoutes);
 app.use("/search", searchRoutes);
 
 // Initialize Socket.io
