@@ -5,17 +5,49 @@ const {
   Message,
 } = require("../models");
 const { sendResponse } = require("../utils/responseUtils");
-const { invalidateParticipants, setParticipantIds, getCachedUsers } = require("../redis/cacheService");
+const { invalidateParticipants, setParticipantIds, getCachedUsers, getOnlineUsers } = require("../redis/cacheService");
 const { getAllUnreads, removeConversationUnread } = require("../redis/unreadService");
 const { Op } = require("sequelize");
 const { sequelizeWrite } = require("../config/database");
 const { addMessageFanoutJob } = require("../jobs/queue");
+const { getUserSockets } = require("../socket/userSocketStore");
 
 function emitNewMessage(conversationId, message) {
   try {
     global._io?.to?.(`conv:${conversationId}`)?.emit?.("message:new", message);
   } catch (e) {
     // ignore socket emit failures (API should still succeed)
+  }
+}
+
+function emitConversationCreatedToUsers(conversation, userIds) {
+  if (!Array.isArray(userIds) || userIds.length === 0) return;
+
+  const payload = {
+    id: conversation.id,
+    type: conversation.type,
+    title: conversation.title,
+    avatar_url: conversation.avatar_url,
+    is_public: conversation.is_public,
+    allow_read_receipts: conversation.allow_read_receipts,
+    last_message_id: conversation.last_message_id,
+    last_message_at: conversation.last_message_at ? conversation.last_message_at.toISOString() : null,
+    last_message_preview: conversation.last_message_preview,
+    last_message_sender_id: conversation.last_message_sender_id,
+    created_by: conversation.created_by,
+    created_at: conversation.created_at ? conversation.created_at.toISOString() : null,
+    participant_count: conversation.participant_count || 0,
+    members: conversation.members || [],
+  };
+
+  for (const uid of userIds) {
+    const sockets = getUserSockets(uid);
+    for (const socketId of sockets) {
+      const socketInstance = global._io?.sockets?.sockets?.get(socketId);
+      if (socketInstance) {
+        socketInstance.emit("conversation:created", payload);
+      }
+    }
   }
 }
 
@@ -33,6 +65,50 @@ async function fanoutSystemMessage({ message, conversation_id, org_id, sender_id
     parent_message_id: null,
     mentions: [],
   });
+}
+
+async function joinUsersToConversationRoom(conversationId, userIds) {
+  const io = global._io;
+  if (!io || !Array.isArray(userIds) || userIds.length === 0) return;
+  const adapter = io.of("/").adapter;
+
+  for (const uid of userIds) {
+    const sockets = getUserSockets(uid);
+    for (const socketId of sockets) {
+      const socket = io.sockets.sockets.get(socketId);
+      if (socket) {
+        socket.join(`conv:${conversationId}`);
+      } else if (typeof adapter.remoteJoin === "function") {
+        try {
+          await adapter.remoteJoin(socketId, `conv:${conversationId}`);
+        } catch (_err) {
+          // best effort
+        }
+      }
+    }
+  }
+}
+
+async function leaveUsersFromConversationRoom(conversationId, userIds) {
+  const io = global._io;
+  if (!io || !Array.isArray(userIds) || userIds.length === 0) return;
+  const adapter = io.of("/").adapter;
+
+  for (const uid of userIds) {
+    const sockets = getUserSockets(uid);
+    for (const socketId of sockets) {
+      const socket = io.sockets.sockets.get(socketId);
+      if (socket) {
+        socket.leave(`conv:${conversationId}`);
+      } else if (typeof adapter.remoteLeave === "function") {
+        try {
+          await adapter.remoteLeave(socketId, `conv:${conversationId}`);
+        } catch (_err) {
+          // best effort
+        }
+      }
+    }
+  }
 }
 
 // GET /conversations — list user's conversations
@@ -116,6 +192,13 @@ const getConversations = async (req, res) => {
     const dmOtherUserIds = Object.values(dmOtherUserMap);
     const allUserIds = [...new Set([...senderIds, ...dmOtherUserIds])];
     const userMap = await getCachedUsers(allUserIds);
+    const onlineUserIds = await getOnlineUsers(org_id, allUserIds);
+    const onlineSet = new Set(onlineUserIds.map((id) => String(id)));
+    const withPresence = (u) => {
+      if (!u) return null;
+      const uid = String(u.user_id || u.id);
+      return { ...u, is_online: onlineSet.has(uid) };
+    };
 
     const conversations = participants.map((p) => {
       const conv = p.conversation.toJSON();
@@ -124,9 +207,11 @@ const getConversations = async (req, res) => {
       // For DMs, set title and avatar_url to the other user's info
       let title = conv.title;
       let avatarUrl = conv.avatar_url;
+      let otherUserId = null;
+      let otherUser = null;
       if (conv.type === 1) {
-        const otherUserId = dmOtherUserMap[conv.id];
-        const otherUser = otherUserId ? userMap[otherUserId] : null;
+        otherUserId = dmOtherUserMap[conv.id] || null;
+        otherUser = otherUserId ? withPresence(userMap[otherUserId]) : null;
         title = otherUser?.name || `User ${otherUserId || ""}`;
         avatarUrl = otherUser?.avatar_url || null;
       }
@@ -140,7 +225,9 @@ const getConversations = async (req, res) => {
         is_muted: p.is_muted,
         last_read_message_id: p.last_read_message_id,
         unread_count: unreads[String(conv.id)] || 0,
-        last_message_sender: userMap[conv.last_message_sender_id] || null,
+        last_message_sender: withPresence(userMap[conv.last_message_sender_id]) || null,
+        other_user_id: conv.type === 1 ? otherUserId : null,
+        other_user: conv.type === 1 ? otherUser : null,
         participant_count: participantCount,
       };
     });
@@ -253,8 +340,64 @@ const createConversation = async (req, res) => {
 
     await t.commit();
 
-    // Cache participant IDs
+    // Cache participant IDs and ensure live sockets join the new conversation room.
     await setParticipantIds(conversation.id, allParticipantIds);
+    await joinUsersToConversationRoom(conversation.id, allParticipantIds);
+
+    // Send a live event for active sockets so newly added/created conversations appear immediately.
+    const eventPayload = {
+      id: conversation.id,
+      type: conversation.type,
+      title: conversation.type === 1 ? null : conversation.title,
+      avatar_url: conversation.type === 1 ? null : conversation.avatar_url,
+      is_public: conversation.is_public,
+      allow_read_receipts: conversation.allow_read_receipts,
+      last_message_id: null,
+      last_message_at: conversation.created_at ? conversation.created_at.toISOString() : null,
+      last_message_preview: null,
+      last_message_sender_id: null,
+      created_by: conversation.created_by,
+      created_at: conversation.created_at ? conversation.created_at.toISOString() : null,
+      is_favorite: 0,
+      is_muted: 0,
+      role: 1,
+      last_read_message_id: null,
+      unread_count: 0,
+      other_user_id: null,
+      other_user: null,
+      participant_count: allParticipantIds.length,
+      members: allParticipantIds,
+    };
+
+    if (type === 1) {
+      const otherUserId = participant_ids[0];
+      eventPayload.other_user_id = otherUserId;
+
+      const users = await getCachedUsers([otherUserId]);
+      const otherUser = users[otherUserId] || null;
+      if (otherUser) {
+        const onlineIds = await getOnlineUsers(org_id, [otherUserId]);
+        eventPayload.other_user = {
+          ...otherUser,
+          is_online: onlineIds.map(String).includes(String(otherUserId)),
+        };
+        eventPayload.title = otherUser.name || otherUser.full_name || otherUser.first_name || `User ${otherUserId}`;
+        eventPayload.avatar_url = otherUser.avatar_url || null;
+      } else {
+        eventPayload.title = `User ${otherUserId}`;
+      }
+    }
+
+    if (type === 2) {
+      eventPayload.title = conversation.title || "Group chat";
+      eventPayload.avatar_url = conversation.avatar_url || null;
+    }
+
+    try {
+      global._io?.to(`conv:${conversation.id}`)?.emit?.("conversation:created", eventPayload);
+    } catch (err) {
+      console.error("conversation:created emit failed:", err.message);
+    }
 
     sendResponse(res, 201, true, "Conversation created", {
       conversation_id: conversation.id,
@@ -292,11 +435,18 @@ const getConversationById = async (req, res) => {
     // Batch user lookup for participants
     const userIds = conversation.participants.map((p) => p.user_id);
     const userMap = await getCachedUsers(userIds);
+    const onlineUserIds = await getOnlineUsers(org_id, userIds);
+    const onlineSet = new Set(onlineUserIds.map((id) => String(id)));
 
     const result = conversation.toJSON();
     result.participants = result.participants.map((p) => ({
       ...p,
-      user: userMap[p.user_id] || null,
+      user: userMap[p.user_id]
+        ? {
+          ...userMap[p.user_id],
+          is_online: onlineSet.has(String(userMap[p.user_id].user_id || userMap[p.user_id].id)),
+        }
+        : null,
     }));
 
     sendResponse(res, 200, true, "Conversation details", { conversation: result });
@@ -372,6 +522,7 @@ const leaveConversation = async (req, res) => {
 
     await participant.update({ is_active: 0, left_at: new Date() });
     await invalidateParticipants(id);
+    await leaveUsersFromConversationRoom(id, [userId]);
     await removeConversationUnread(userId, id);
 
     // Log + system message
@@ -446,11 +597,20 @@ const addMembers = async (req, res) => {
       }
     }
 
+    const cachedUsers = await getCachedUsers(newUserIds);
     const createdSystemMessages = [];
     // System message + log for each member
     for (const uid of newUserIds) {
+      const targetName = cachedUsers[uid]?.name || cachedUsers[uid]?.full_name || cachedUsers[uid]?.first_name || `User ${uid}`;
       const sysMsg = await Message.create(
-        { conversation_id: id, org_id, sender_id: userId, kind: 3, system_action: "member_added" },
+        {
+          conversation_id: id,
+          org_id,
+          sender_id: userId,
+          kind: 3,
+          content: `Added ${targetName} to the group`,
+          system_action: "member_added",
+        },
         { transaction: t }
       );
       createdSystemMessages.push(sysMsg);
@@ -462,6 +622,23 @@ const addMembers = async (req, res) => {
 
     await t.commit();
     await invalidateParticipants(id);
+    await joinUsersToConversationRoom(id, newUserIds);
+
+    const participantRows = await ConversationParticipant.findAll({
+      where: { conversation_id: id, is_active: 1 },
+      attributes: ["user_id"],
+      raw: true,
+    });
+    const activeParticipantIds = participantRows.map((row) => row.user_id);
+
+    emitConversationCreatedToUsers(
+      {
+        ...conversation.toJSON(),
+        participant_count: activeParticipantIds.length,
+        members: activeParticipantIds,
+      },
+      newUserIds
+    );
 
     // Emit to sockets + fanout for unread/notifications
     for (const msg of createdSystemMessages) {
@@ -503,13 +680,21 @@ const removeMember = async (req, res) => {
 
     await target.update({ is_active: 0, left_at: new Date() });
     await invalidateParticipants(id);
+    await leaveUsersFromConversationRoom(id, [targetUserId]);
     await removeConversationUnread(targetUserId, id);
 
+    const cachedTarget = await getCachedUsers([targetUserId]);
+    const targetName = cachedTarget[targetUserId]?.name || cachedTarget[targetUserId]?.full_name || cachedTarget[targetUserId]?.first_name || `User ${targetUserId}`;
     await ConversationActivityLog.create({
       conversation_id: id, org_id, actor_id: actorId, action: "member_removed", target_user_id: targetUserId,
     });
     const sysMsg = await Message.create({
-      conversation_id: id, org_id, sender_id: actorId, kind: 3, system_action: "member_removed",
+      conversation_id: id,
+      org_id,
+      sender_id: actorId,
+      kind: 3,
+      content: `Removed ${targetName} from the group`,
+      system_action: "member_removed",
     });
     emitNewMessage(id, sysMsg.toJSON());
     await fanoutSystemMessage({

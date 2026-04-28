@@ -2,6 +2,7 @@ const { Message, ConversationParticipant, MessageReaction, MessageEdit, MessageD
 const { getIdempotencyKey, setIdempotencyKey, getParticipantIds, checkRateLimit } = require("../redis/cacheService");
 const { addMessageFanoutJob } = require("../jobs/queue");
 const processMessageFanout = require("../jobs/messageFanout");
+const { sanitizeRichText, toPlainText } = require("../utils/richText");
 
 const MESSAGE_KIND = { TEXT: 1, FILE: 2, SYSTEM: 3 };
 
@@ -27,6 +28,12 @@ function setupMessageHandler(io, socket) {
 
       if (!conversation_id) {
         return ack?.({ error: "conversation_id is required" });
+      }
+
+      const safeContent = sanitizeRichText(content || "");
+      const plainContent = toPlainText(safeContent);
+      if (Number(kind) === MESSAGE_KIND.TEXT && !plainContent) {
+        return ack?.({ error: "Message content is required" });
       }
 
       // Rate limit: 60 msg/min per user
@@ -62,7 +69,7 @@ function setupMessageHandler(io, socket) {
         sender_id: userId,
         parent_message_id: parent_message_id || null,
         kind,
-        content: content || null,
+        content: safeContent || null,
         file_reference_id: file_reference_id || null,
         file_name: file_name || null,
         file_type: file_type || null,
@@ -90,7 +97,8 @@ function setupMessageHandler(io, socket) {
         conversation_id,
         org_id: orgId,
         sender_id: userId,
-        content: content || null,
+        content: plainContent || null,
+        file_name: file_name || null,
         kind,
         parent_message_id: parent_message_id || null,
         mentions: mentions || [],
@@ -111,7 +119,15 @@ function setupMessageHandler(io, socket) {
   socket.on("message:edit", async (data, ack) => {
     try {
       const { message_id, content } = data;
-      if (!message_id || !content) return ack?.({ error: "message_id and content required" });
+      if (!message_id || content === undefined || content === null) {
+        return ack?.({ error: "message_id and content required" });
+      }
+
+      const safeContent = sanitizeRichText(content || "");
+      const plainContent = toPlainText(safeContent);
+      if (!plainContent) {
+        return ack?.({ error: "Message content is required" });
+      }
 
       const message = await Message.findOne({
         where: { id: message_id, sender_id: userId, org_id: orgId, is_deleted: 0 },
@@ -128,7 +144,7 @@ function setupMessageHandler(io, socket) {
       });
 
       // Update message
-      await message.update({ content, is_edited: 1 });
+      await message.update({ content: safeContent, is_edited: 1 });
 
       const updatedMsg = message.toJSON();
       ack?.({ success: true, message: updatedMsg });
@@ -224,6 +240,7 @@ function setupMessageHandler(io, socket) {
       ack?.({ success: true });
       io.to(`conv:${message.conversation_id}`).emit("message:reaction", {
         message_id,
+        conversation_id: message.conversation_id,
         reactions: reactionList,
       });
     } catch (error) {

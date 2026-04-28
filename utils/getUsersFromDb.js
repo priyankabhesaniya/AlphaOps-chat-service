@@ -19,16 +19,28 @@ async function getAuthSequelize() {
 
 /**
  * Fetch users from auth_db.users table by IDs.
- * Returns { userId: { id, name, email, avatar_url, title } }
+ * Returns { userId: { id, name, email, avatar_url, title, designation, about } }
  */
 async function getUsersFromDb(userIds) {
   if (!userIds || userIds.length === 0) return {};
   try {
     const db = await getAuthSequelize();
     const rows = await db.query(
-      `SELECT id, username, first_name, last_name, email, avatar_url
-       FROM users
-       WHERE id IN (:ids) AND is_deleted = 0`,
+      `SELECT
+         u.id,
+         u.username,
+         u.first_name,
+         u.last_name,
+         u.email,
+         u.avatar_url,
+         u.role_id,
+         r.name AS role_name
+       FROM users u
+       LEFT JOIN roles r
+         ON r.id = u.role_id
+        AND r.org_id = u.org_id
+        AND r.is_deleted = 0
+       WHERE u.id IN (:ids) AND u.is_deleted = 0`,
       {
         replacements: { ids: userIds },
         type: Sequelize.QueryTypes.SELECT,
@@ -44,6 +56,10 @@ async function getUsersFromDb(userIds) {
         username: r.username,
         email: r.email,
         avatar_url: r.avatar_url,
+        role_id: r.role_id || null,
+        title: r.role_name || "",
+        designation: r.role_name || "",
+        about: "",
       };
     }
     return map;

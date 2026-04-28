@@ -4,6 +4,7 @@ const { incrementUnreadBulk, isConnected: redisConnected } = require("../redis/u
 const { userSockets } = require("../socket/userSocketStore");
 const { isConnected } = require("../redis/client");
 const axios = require("axios");
+const { toPlainText } = require("../utils/richText");
 
 const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL || "http://localhost:3008";
 
@@ -30,6 +31,7 @@ async function processMessageFanout(job) {
     org_id,
     sender_id,
     content,
+    file_name,
     kind,
     parent_message_id,
     mentions,
@@ -94,7 +96,13 @@ async function processMessageFanout(job) {
   }
 
   // 4. Update conversation denormalized fields
-  const preview = content ? content.substring(0, 200) : null;
+  const plainContent = toPlainText(content || "");
+  const preview =
+    Number(kind) === 1
+      ? (plainContent ? plainContent.substring(0, 200) : null)
+      : Number(kind) === 2
+        ? (file_name || null)
+        : (plainContent ? plainContent.substring(0, 200) : null);
   await Conversation.update(
     {
       last_message_id: message_id,
@@ -127,13 +135,13 @@ async function processMessageFanout(job) {
   }
 
   // 7. Populate search index (text messages only)
-  if (kind === 1 && content) {
+  if (Number(kind) === 1 && plainContent) {
     await MessageSearchIndex.create({
       message_id,
       conversation_id,
       org_id,
       sender_id,
-      content,
+      content: plainContent,
       created_at: new Date(),
     });
   }

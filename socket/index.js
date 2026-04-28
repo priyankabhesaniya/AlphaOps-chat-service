@@ -2,7 +2,7 @@ const { Server } = require("socket.io");
 const jwt = require("jsonwebtoken");
 const { redis, isConnected } = require("../redis/client");
 const { ConversationParticipant } = require("../models");
-const { setPresence, removePresence } = require("../redis/cacheService");
+const { setPresence, removePresence, getOnlineUsers } = require("../redis/cacheService");
 const setupMessageHandler = require("./messageHandler");
 const setupPresenceHandler = require("./presenceHandler");
 const setupReadHandler = require("./readHandler");
@@ -73,6 +73,7 @@ function initSocket(server) {
 
     // Set presence
     await setPresence(orgId, userId);
+    socket.join(`org:${orgId}`);
 
     // Join user to all their active conversation rooms
     try {
@@ -84,12 +85,33 @@ function initSocket(server) {
       participations.forEach((p) => {
         socket.join(`conv:${p.conversation_id}`);
       });
+
+      // Emit initial snapshot of online users visible to this user.
+      const convIds = participations.map((p) => p.conversation_id);
+      if (convIds.length > 0) {
+        const peerRows = await ConversationParticipant.findAll({
+          where: { conversation_id: convIds, org_id: orgId, is_active: 1 },
+          attributes: ["user_id"],
+          raw: true,
+        });
+        const visibleUserIds = [...new Set(peerRows.map((p) => p.user_id))];
+        const onlineUserIds = await getOnlineUsers(orgId, visibleUserIds);
+        socket.emit("presence:snapshot", {
+          online_user_ids: onlineUserIds.map((id) => Number(id)),
+          is_full_snapshot: false,
+        });
+      } else {
+        socket.emit("presence:snapshot", {
+          online_user_ids: [Number(userId)],
+          is_full_snapshot: false,
+        });
+      }
     } catch (err) {
       console.error("Error joining rooms on connect:", err.message);
     }
 
     // Broadcast online status to org
-    socket.broadcast.emit("presence:update", {
+    socket.to(`org:${orgId}`).emit("presence:update", {
       user_id: userId,
       is_online: true,
     });
@@ -99,6 +121,44 @@ function initSocket(server) {
     setupPresenceHandler(io, socket);
     setupReadHandler(io, socket);
 
+    socket.on("rooms:sync", async (data) => {
+      try {
+        const requested = Array.isArray(data?.conversation_ids)
+          ? data.conversation_ids.map((id) => String(id)).filter(Boolean)
+          : [];
+        const desiredRooms = new Set(requested.map((id) => `conv:${id}`));
+        const currentRooms = [...socket.rooms].filter((room) => room.startsWith("conv:"));
+        currentRooms.forEach((room) => {
+          if (!desiredRooms.has(room)) {
+            socket.leave(room);
+          }
+        });
+        desiredRooms.forEach((room) => socket.join(room));
+
+        // Send a fresh presence snapshot for the users visible through the newly synced rooms.
+        if (requested.length > 0) {
+          const peerRows = await ConversationParticipant.findAll({
+            where: { conversation_id: requested, org_id: orgId, is_active: 1 },
+            attributes: ["user_id"],
+            raw: true,
+          });
+          const visibleUserIds = [...new Set(peerRows.map((p) => p.user_id))];
+          const onlineUserIds = await getOnlineUsers(orgId, visibleUserIds);
+          socket.emit("presence:snapshot", {
+            online_user_ids: onlineUserIds.map((id) => Number(id)),
+            is_full_snapshot: false,
+          });
+        } else {
+          socket.emit("presence:snapshot", {
+            online_user_ids: [Number(userId)],
+            is_full_snapshot: false,
+          });
+        }
+      } catch (err) {
+        console.error("rooms:sync error:", err.message);
+      }
+    });
+
     // Disconnect
     socket.on("disconnect", async () => {
       const sockets = userSockets.get(userIdStr);
@@ -107,7 +167,7 @@ function initSocket(server) {
         if (sockets.size === 0) {
           userSockets.delete(userIdStr);
           await removePresence(orgId, userId);
-          socket.broadcast.emit("presence:update", {
+          socket.to(`org:${orgId}`).emit("presence:update", {
             user_id: userId,
             is_online: false,
             last_seen_at: new Date().toISOString(),
