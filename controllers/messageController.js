@@ -7,7 +7,7 @@ const {
   ConversationParticipant,
 } = require("../models");
 const { sendResponse } = require("../utils/responseUtils");
-const { getCachedUsers } = require("../redis/cacheService");
+const { getCachedUsers, getMessageDeliveries } = require("../redis/cacheService");
 const { Op } = require("sequelize");
 
 // GET /conversations/:id/messages — cursor-based pagination
@@ -169,7 +169,7 @@ const getThread = async (req, res) => {
   }
 };
 
-// GET /conversations/:id/messages/:msgId/info — who read + reactions + edit history
+// GET /conversations/:id/messages/:msgId/info — who read + delivered + not_received + reactions + edit history
 const getMessageInfo = async (req, res) => {
   try {
     const { org_id } = req.user;
@@ -186,13 +186,48 @@ const getMessageInfo = async (req, res) => {
       raw: true,
     });
 
-    const userIds = readBy.map((r) => r.user_id);
-    const userMap = await getCachedUsers(userIds);
+    const readUserIds = readBy.map((r) => r.user_id);
+    const readUserMap = await getCachedUsers(readUserIds);
 
     const readReceipts = readBy.map((r) => ({
       user_id: r.user_id,
-      user: userMap[r.user_id] || null,
+      user: readUserMap[r.user_id] || null,
       read_at: r.last_read_at,
+    }));
+
+    // Delivery receipts (Redis → DB fallback)
+    const deliveredToRaw = await getMessageDeliveries(msgId);
+    const deliveredUserIds = deliveredToRaw.map((d) => d.user_id);
+    const deliveredUserMap = await getCachedUsers(deliveredUserIds);
+    const deliveredTo = deliveredToRaw.map((d) => ({
+      user_id: d.user_id,
+      user: deliveredUserMap[d.user_id] || null,
+      delivered_at: d.delivered_at,
+    }));
+
+    // NOT RECEIVED: participants who haven't read or received the message yet (excluding sender)
+    const targetMsg = await Message.findByPk(msgId, { attributes: ["sender_id"], raw: true });
+    const allParticipants = await ConversationParticipant.findAll({
+      where: { conversation_id: conversationId, is_active: 1 },
+      attributes: ["user_id"],
+      raw: true,
+    });
+
+    const readSet = new Set(readUserIds.map(String));
+    const deliveredSet = new Set(deliveredUserIds.map(String));
+    const senderStr = targetMsg ? String(targetMsg.sender_id) : null;
+
+    const notReceivedIds = allParticipants
+      .map((p) => p.user_id)
+      .filter((uid) => {
+        const s = String(uid);
+        return s !== senderStr && !readSet.has(s) && !deliveredSet.has(s);
+      });
+
+    const notReceivedUserMap = await getCachedUsers(notReceivedIds);
+    const notReceived = notReceivedIds.map((uid) => ({
+      user_id: uid,
+      user: notReceivedUserMap[uid] || null,
     }));
 
     // Reactions
@@ -217,6 +252,8 @@ const getMessageInfo = async (req, res) => {
 
     sendResponse(res, 200, true, "Message info", {
       read_by: readReceipts,
+      delivered_to: deliveredTo,
+      not_received: notReceived,
       reactions: groupedReactions,
       edit_history: edits,
     });

@@ -7,6 +7,7 @@ const MessageReaction = require('./messageReaction');
 const MessageEdit = require('./messageEdit');
 const MessageMention = require('./messageMention');
 const MessageDeletion = require('./messageDeletion');
+const MessageDelivery = require('./messageDelivery');
 const StarredMessage = require('./starredMessage');
 const ConversationActivityLog = require('./conversationActivityLog');
 const UserCache = require('./userCache');
@@ -53,6 +54,7 @@ const db = {
   MessageEdit,
   MessageMention,
   MessageDeletion,
+  MessageDelivery,
   StarredMessage,
   ConversationActivityLog,
   UserCache,

@@ -1,10 +1,49 @@
 const { Message, ConversationParticipant, MessageReaction, MessageEdit, MessageDeletion } = require("../models");
-const { getIdempotencyKey, setIdempotencyKey, getParticipantIds, checkRateLimit } = require("../redis/cacheService");
+const { getIdempotencyKey, setIdempotencyKey, getConversationParticipantIds, checkRateLimit, addMessageDelivery, getMessageDeliveries } = require("../redis/cacheService");
 const { addMessageFanoutJob } = require("../jobs/queue");
 const processMessageFanout = require("../jobs/messageFanout");
 const { sanitizeRichText, toPlainText } = require("../utils/richText");
 
 const MESSAGE_KIND = { TEXT: 1, FILE: 2, SYSTEM: 3 };
+
+async function collectDeliveredRecipients(io, conversationId, senderId) {
+  const room = `conv:${conversationId}`;
+  const socketIds = await io.in(room).allSockets();
+  const deliveredMap = new Map();
+
+  for (const socketId of socketIds) {
+    const recipientSocket = io.sockets.sockets.get(socketId);
+    if (!recipientSocket) continue;
+    const recipientId = recipientSocket.userId;
+    if (!recipientId || String(recipientId) === String(senderId)) continue;
+    if (!deliveredMap.has(String(recipientId))) {
+      deliveredMap.set(String(recipientId), {
+        user_id: recipientId,
+        delivered_at: new Date().toISOString(),
+      });
+    }
+  }
+
+  return Array.from(deliveredMap.values());
+}
+
+async function sendDeliveredEvent(io, conversationId, messageId, recipientCount) {
+  // Always fetch the full persisted delivery list so the event reflects cumulative state
+  const persistedDeliveries = await getMessageDeliveries(messageId);
+  const deliveredUserIds = persistedDeliveries.map((d) => d.user_id);
+  const deliveredToAll = recipientCount > 0 && deliveredUserIds.length >= recipientCount;
+  const message = await Message.findByPk(messageId, { attributes: ["client_message_id"], raw: true });
+
+  io.to(`conv:${conversationId}`).emit("message:delivered", {
+    conversation_id: conversationId,
+    message_id: messageId,
+    client_message_id: message?.client_message_id || null,
+    delivered_to: persistedDeliveries,
+    delivered_to_all: deliveredToAll,
+    delivered_count: deliveredUserIds.length,
+    recipient_count: recipientCount,
+  });
+}
 
 function setupMessageHandler(io, socket) {
   const { userId, orgId } = socket;
@@ -91,6 +130,20 @@ function setupMessageHandler(io, socket) {
       // Emit to conversation room
       io.to(`conv:${conversation_id}`).emit("message:new", msgData);
 
+      // Collect online recipients from room and mark them as delivered immediately
+      const deliveredTo = await collectDeliveredRecipients(io, conversation_id, userId);
+      const participantIds = await getConversationParticipantIds(conversation_id, orgId);
+      const recipientCount = Math.max(0, participantIds.length - 1);
+
+      if (deliveredTo.length > 0) {
+        await Promise.all(
+          deliveredTo.map((delivery) =>
+            addMessageDelivery(message.id, delivery, conversation_id, orgId)
+          )
+        );
+        await sendDeliveredEvent(io, conversation_id, message.id, recipientCount);
+      }
+
       // Enqueue async fan-out (unread, notifications, conversation update, search)
       const fanoutPayload = {
         message_id: message.id,
@@ -105,13 +158,41 @@ function setupMessageHandler(io, socket) {
       };
 
       const queuedJob = await addMessageFanoutJob(fanoutPayload);
-      // Redis/Bull can be unavailable locally; fallback to direct execution so unread/push still work.
       if (!queuedJob) {
         await processMessageFanout({ data: fanoutPayload });
       }
     } catch (error) {
       console.error("message:send error:", error.message);
       ack?.({ error: "Failed to send message" });
+    }
+  });
+
+  // --- Message delivered acknowledgement from recipient client ---
+  socket.on("message:delivered", async (data, ack) => {
+    try {
+      const { conversation_id, message_id } = data;
+      if (!conversation_id || !message_id) {
+        return ack?.({ error: "conversation_id and message_id required" });
+      }
+
+      const participantIds = await getConversationParticipantIds(conversation_id, orgId);
+      if (!participantIds.map(String).includes(String(userId))) {
+        return ack?.({ error: "User not part of conversation" });
+      }
+
+      const delivery = {
+        user_id: userId,
+        delivered_at: new Date().toISOString(),
+      };
+      await addMessageDelivery(message_id, delivery, conversation_id, orgId);
+
+      const recipientCount = Math.max(0, participantIds.length - 1);
+      await sendDeliveredEvent(io, conversation_id, message_id, recipientCount);
+
+      ack?.({ success: true });
+    } catch (error) {
+      console.error("message:delivered error:", error.message);
+      ack?.({ error: "Failed to acknowledge delivery" });
     }
   });
 
@@ -168,7 +249,6 @@ function setupMessageHandler(io, socket) {
           defaults: { message_id, user_id: userId, org_id: orgId, deleted_at: new Date() },
         });
         ack?.({ success: true });
-        // Only sender sees this change via socket
         socket.emit("message:deleted", { message_id, delete_type: "for_me" });
       } else if (delete_type === "for_all") {
         const message = await Message.findOne({
@@ -250,4 +330,4 @@ function setupMessageHandler(io, socket) {
   });
 }
 
-module.exports = setupMessageHandler;
+module.exports = { setupMessageHandler, sendDeliveredEvent };

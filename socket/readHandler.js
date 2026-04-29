@@ -1,5 +1,6 @@
-const { ConversationParticipant, Conversation } = require("../models");
+const { ConversationParticipant, Conversation, Message } = require("../models");
 const { resetUnread } = require("../redis/unreadService");
+const { Op } = require("sequelize");
 
 function setupReadHandler(io, socket) {
   const { userId, orgId } = socket;
@@ -37,7 +38,6 @@ function setupReadHandler(io, socket) {
           }
         );
       } else {
-        // Temp ID — still clear unread_count column but skip the invalid message ID
         await ConversationParticipant.update(
           { last_read_at: new Date(), unread_count: 0 },
           { where: { conversation_id, user_id: userId, org_id: orgId, is_active: 1 } }
@@ -54,11 +54,45 @@ function setupReadHandler(io, socket) {
       });
 
       if (conv && conv.allow_read_receipts) {
+        const messageForReceipt = isValidMessageId
+          ? await Message.findByPk(messageIdInt, { attributes: ["client_message_id", "sender_id"], raw: true })
+          : null;
+
+        // Compute all_read: count participants (excluding current user who just read)
+        // whose last_read_message_id >= messageIdInt (they've read at least up to this message)
+        let allRead = false;
+        if (isValidMessageId && messageForReceipt) {
+          // Total active recipients (everyone except the original message sender)
+          const totalRecipients = await ConversationParticipant.count({
+            where: {
+              conversation_id,
+              org_id: orgId,
+              is_active: 1,
+              user_id: { [Op.ne]: messageForReceipt.sender_id },
+            },
+          });
+
+          // How many of those have read up to this message (including the current user who just read)
+          const readCount = await ConversationParticipant.count({
+            where: {
+              conversation_id,
+              org_id: orgId,
+              is_active: 1,
+              user_id: { [Op.ne]: messageForReceipt.sender_id },
+              last_read_message_id: { [Op.gte]: messageIdInt },
+            },
+          });
+
+          allRead = totalRecipients > 0 && readCount >= totalRecipients;
+        }
+
         socket.to(`conv:${conversation_id}`).emit("message:read_receipt", {
           conversation_id,
           user_id: userId,
           message_id,
+          client_message_id: messageForReceipt?.client_message_id || null,
           read_at: new Date().toISOString(),
+          all_read: allRead,
         });
       }
     } catch (error) {

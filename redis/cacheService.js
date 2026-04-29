@@ -1,5 +1,6 @@
 const { redis, isConnected } = require("./client");
 const { getUsersFromDb } = require("../utils/getUsersFromDb");
+const { ConversationParticipant, MessageDelivery } = require("../models");
 
 const PRESENCE_TTL = 30;
 const TYPING_TTL = 3;
@@ -57,6 +58,24 @@ async function getParticipantIds(conversationId) {
   if (!isConnected()) return null;
   const val = await redis.get(`conv:participants:${conversationId}`);
   return val ? JSON.parse(val) : null;
+}
+
+async function getConversationParticipantIds(conversationId, orgId) {
+  const cached = await getParticipantIds(conversationId);
+  if (Array.isArray(cached) && cached.length > 0) {
+    return cached;
+  }
+
+  const rows = await ConversationParticipant.findAll({
+    where: { conversation_id: conversationId, org_id: orgId, is_active: 1 },
+    attributes: ["user_id"],
+    raw: true,
+  });
+  const ids = rows.map((r) => r.user_id);
+  if (isConnected()) {
+    await redis.set(`conv:participants:${conversationId}`, JSON.stringify(ids), "EX", PARTICIPANT_CACHE_TTL).catch(() => {});
+  }
+  return ids;
 }
 
 async function invalidateParticipants(conversationId) {
@@ -121,6 +140,8 @@ async function getIdempotencyKey(clientMessageId) {
   return redis.get(`idem:${clientMessageId}`);
 }
 
+const MESSAGE_DELIVERY_TTL = 86400; // 24 hours
+
 // --- Rate Limiting ---
 
 async function checkRateLimit(key, maxCount, windowSeconds) {
@@ -132,6 +153,56 @@ async function checkRateLimit(key, maxCount, windowSeconds) {
   return current <= maxCount;
 }
 
+async function addMessageDelivery(messageId, delivery, conversationId, orgId) {
+  const deliveredAt = delivery.delivered_at || new Date().toISOString();
+
+  // Write to Redis (fast path)
+  if (isConnected()) {
+    try {
+      const key = `message:delivery:${messageId}`;
+      await redis.hset(key, String(delivery.user_id), JSON.stringify({ ...delivery, delivered_at: deliveredAt }));
+      await redis.expire(key, MESSAGE_DELIVERY_TTL);
+    } catch (_) { /* non-critical */ }
+  }
+
+  // Write to DB (permanent record) — ignore duplicate via ignoreDuplicates
+  if (conversationId != null && orgId != null) {
+    try {
+      await MessageDelivery.bulkCreate(
+        [{ message_id: messageId, user_id: delivery.user_id, conversation_id: conversationId, org_id: orgId, delivered_at: new Date(deliveredAt) }],
+        { ignoreDuplicates: true }
+      );
+    } catch (_) { /* non-critical */ }
+  }
+}
+
+async function getMessageDeliveries(messageId) {
+  // Try Redis first
+  if (isConnected()) {
+    try {
+      const key = `message:delivery:${messageId}`;
+      const values = await redis.hvals(key);
+      if (values && values.length > 0) {
+        return values
+          .map((raw) => { try { return JSON.parse(raw); } catch { return null; } })
+          .filter(Boolean);
+      }
+    } catch (_) { /* fall through to DB */ }
+  }
+
+  // Fallback: read from DB
+  try {
+    const rows = await MessageDelivery.findAll({
+      where: { message_id: messageId },
+      attributes: ['user_id', 'delivered_at'],
+      raw: true,
+    });
+    return rows.map((r) => ({ user_id: r.user_id, delivered_at: r.delivered_at }));
+  } catch (_) {
+    return [];
+  }
+}
+
 module.exports = {
   setPresence,
   getPresence,
@@ -141,6 +212,7 @@ module.exports = {
   removeTyping,
   setParticipantIds,
   getParticipantIds,
+  getConversationParticipantIds,
   invalidateParticipants,
   setCachedUser,
   getCachedUser,
@@ -148,4 +220,6 @@ module.exports = {
   setIdempotencyKey,
   getIdempotencyKey,
   checkRateLimit,
+  addMessageDelivery,
+  getMessageDeliveries,
 };

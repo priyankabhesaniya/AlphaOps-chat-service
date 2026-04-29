@@ -1,12 +1,68 @@
 const { Server } = require("socket.io");
 const jwt = require("jsonwebtoken");
+const { Op } = require("sequelize");
 const { redis, isConnected } = require("../redis/client");
-const { ConversationParticipant } = require("../models");
-const { setPresence, removePresence, getOnlineUsers } = require("../redis/cacheService");
-const setupMessageHandler = require("./messageHandler");
+const { ConversationParticipant, Message, MessageDelivery } = require("../models");
+const { setPresence, removePresence, getOnlineUsers, addMessageDelivery, getConversationParticipantIds } = require("../redis/cacheService");
+const { setupMessageHandler, sendDeliveredEvent } = require("./messageHandler");
 const setupPresenceHandler = require("./presenceHandler");
 const setupReadHandler = require("./readHandler");
 const { userSockets, getUserSockets } = require("./userSocketStore");
+
+/**
+ * For each conversation the newly connected user participates in, find messages
+ * that were sent while they were offline (not yet in message_deliveries for this user)
+ * and emit delivery events to those senders.
+ * Fire-and-forget — never blocks the connect flow.
+ */
+async function reconcilePendingDeliveries(io, userId, orgId, participations) {
+  if (!participations || participations.length === 0) return;
+
+  const conversationIds = participations.map((p) => p.conversation_id);
+  const now = new Date().toISOString();
+
+  for (const convId of conversationIds) {
+    try {
+      // Find the highest message_id already delivered by this user in this conversation
+      const lastDelivered = await MessageDelivery.findOne({
+        where: { conversation_id: convId, user_id: userId },
+        order: [["message_id", "DESC"]],
+        attributes: ["message_id"],
+        raw: true,
+      });
+      const afterId = lastDelivered ? lastDelivered.message_id : 0;
+
+      // Find undelivered messages (sent by others, newer than what was delivered, limit 100)
+      const undelivered = await Message.findAll({
+        where: {
+          conversation_id: convId,
+          sender_id: { [Op.ne]: userId },
+          is_deleted: 0,
+          id: { [Op.gt]: afterId },
+        },
+        order: [["id", "DESC"]],
+        limit: 100,
+        attributes: ["id", "sender_id", "conversation_id", "client_message_id"],
+        raw: true,
+      });
+
+      if (undelivered.length === 0) continue;
+
+      // Get participant count for delivered_to_all computation
+      const participantIds = await getConversationParticipantIds(convId, orgId);
+      const recipientCount = Math.max(0, participantIds.length - 1);
+
+      for (const msg of undelivered) {
+        const delivery = { user_id: userId, delivered_at: now };
+        await addMessageDelivery(msg.id, delivery, convId, orgId);
+        // Notify senders by broadcasting the updated delivery state to the room
+        await sendDeliveredEvent(io, convId, msg.id, recipientCount);
+      }
+    } catch (err) {
+      console.error(`[reconcile] conv ${convId}:`, err.message);
+    }
+  }
+}
 
 function initSocket(server) {
   const io = new Server(server, {
@@ -76,8 +132,9 @@ function initSocket(server) {
     socket.join(`org:${orgId}`);
 
     // Join user to all their active conversation rooms
+    let participations = [];
     try {
-      const participations = await ConversationParticipant.findAll({
+      participations = await ConversationParticipant.findAll({
         where: { user_id: userId, org_id: orgId, is_active: 1 },
         attributes: ["conversation_id"],
         raw: true,
@@ -120,6 +177,11 @@ function initSocket(server) {
     setupMessageHandler(io, socket);
     setupPresenceHandler(io, socket);
     setupReadHandler(io, socket);
+
+    // Fire-and-forget: mark messages as delivered that arrived while this user was offline
+    reconcilePendingDeliveries(io, userId, orgId, participations).catch((err) => {
+      console.error("[reconcile] error:", err.message);
+    });
 
     socket.on("rooms:sync", async (data) => {
       try {
