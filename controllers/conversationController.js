@@ -7,6 +7,7 @@ const {
 const { sendResponse } = require("../utils/responseUtils");
 const { invalidateParticipants, setParticipantIds, getCachedUsers, getOnlineUsers } = require("../redis/cacheService");
 const { getAllUnreads, removeConversationUnread } = require("../redis/unreadService");
+const { isConnected: isRedisConnected } = require("../redis/client");
 const { Op } = require("sequelize");
 const { sequelizeWrite } = require("../config/database");
 const { addMessageFanoutJob } = require("../jobs/queue");
@@ -134,7 +135,7 @@ const getConversations = async (req, res) => {
           ],
         },
       ],
-      attributes: ["conversation_id", "role", "is_favorite", "is_muted", "last_read_message_id"],
+      attributes: ["conversation_id", "role", "is_favorite", "is_muted", "last_read_message_id", "unread_count"],
       order: [
         ["is_favorite", "DESC"],
         [sequelizeWrite.literal("CASE WHEN `conversation`.`last_message_at` IS NULL THEN 1 ELSE 0 END"), "ASC"],
@@ -144,8 +145,9 @@ const getConversations = async (req, res) => {
       offset,
     });
 
-    // Fetch unread counts from Redis/fallback
-    const unreads = await getAllUnreads(userId);
+    // Fetch unread counts from Redis. If Redis is unavailable, use DB snapshot.
+    const redisAvailable = isRedisConnected();
+    const unreads = redisAvailable ? await getAllUnreads(userId) : {};
 
     // Get conversation IDs for participant counts + DM other-user resolution
     const convIds = participants.map((p) => p.conversation_id);
@@ -224,7 +226,9 @@ const getConversations = async (req, res) => {
         is_favorite: p.is_favorite,
         is_muted: p.is_muted,
         last_read_message_id: p.last_read_message_id,
-        unread_count: unreads[String(conv.id)] || 0,
+        unread_count: redisAvailable
+          ? (unreads[String(conv.id)] || 0)
+          : (p.unread_count || 0),
         last_message_sender: withPresence(userMap[conv.last_message_sender_id]) || null,
         other_user_id: conv.type === 1 ? otherUserId : null,
         other_user: conv.type === 1 ? otherUser : null,
@@ -598,27 +602,31 @@ const addMembers = async (req, res) => {
     }
 
     const cachedUsers = await getCachedUsers(newUserIds);
-    const createdSystemMessages = [];
-    // System message + log for each member
+    const cachedActor = await getCachedUsers([userId]);
+    const actorName = cachedActor[userId]?.name || cachedActor[userId]?.full_name || cachedActor[userId]?.first_name || `User ${userId}`;
+
+    // Activity log per member (audit), but one combined system message
     for (const uid of newUserIds) {
-      const targetName = cachedUsers[uid]?.name || cachedUsers[uid]?.full_name || cachedUsers[uid]?.first_name || `User ${uid}`;
-      const sysMsg = await Message.create(
-        {
-          conversation_id: id,
-          org_id,
-          sender_id: userId,
-          kind: 3,
-          content: `Added ${targetName} to the group`,
-          system_action: "member_added",
-        },
-        { transaction: t }
-      );
-      createdSystemMessages.push(sysMsg);
       await ConversationActivityLog.create(
         { conversation_id: id, org_id, actor_id: userId, action: "member_added", target_user_id: uid },
         { transaction: t }
       );
     }
+
+    const nameList = newUserIds
+      .map((uid) => cachedUsers[uid]?.name || cachedUsers[uid]?.full_name || cachedUsers[uid]?.first_name || `User ${uid}`)
+      .join(", ");
+    const sysMsg = await Message.create(
+      {
+        conversation_id: id,
+        org_id,
+        sender_id: userId,
+        kind: 3,
+        content: `${actorName} added ${nameList}`,
+        system_action: "member_added",
+      },
+      { transaction: t }
+    );
 
     await t.commit();
     await invalidateParticipants(id);
@@ -640,17 +648,14 @@ const addMembers = async (req, res) => {
       newUserIds
     );
 
-    // Emit to sockets + fanout for unread/notifications
-    for (const msg of createdSystemMessages) {
-      emitNewMessage(id, msg.toJSON());
-      await fanoutSystemMessage({
-        message: msg,
-        conversation_id: id,
-        org_id,
-        sender_id: userId,
-        system_action: "member_added",
-      });
-    }
+    emitNewMessage(id, sysMsg.toJSON());
+    await fanoutSystemMessage({
+      message: sysMsg,
+      conversation_id: id,
+      org_id,
+      sender_id: userId,
+      system_action: "member_added",
+    });
 
     sendResponse(res, 200, true, "Members added", { added: newUserIds });
   } catch (error) {
@@ -683,8 +688,12 @@ const removeMember = async (req, res) => {
     await leaveUsersFromConversationRoom(id, [targetUserId]);
     await removeConversationUnread(targetUserId, id);
 
-    const cachedTarget = await getCachedUsers([targetUserId]);
+    const [cachedTarget, cachedActor] = await Promise.all([
+      getCachedUsers([targetUserId]),
+      getCachedUsers([actorId]),
+    ]);
     const targetName = cachedTarget[targetUserId]?.name || cachedTarget[targetUserId]?.full_name || cachedTarget[targetUserId]?.first_name || `User ${targetUserId}`;
+    const actorName = cachedActor[actorId]?.name || cachedActor[actorId]?.full_name || cachedActor[actorId]?.first_name || `User ${actorId}`;
     await ConversationActivityLog.create({
       conversation_id: id, org_id, actor_id: actorId, action: "member_removed", target_user_id: targetUserId,
     });
@@ -693,7 +702,7 @@ const removeMember = async (req, res) => {
       org_id,
       sender_id: actorId,
       kind: 3,
-      content: `Removed ${targetName} from the group`,
+      content: `${actorName} removed ${targetName}`,
       system_action: "member_removed",
     });
     emitNewMessage(id, sysMsg.toJSON());

@@ -6,6 +6,7 @@ const cors = require("cors");
 const conversationRoutes = require("./routes/conversationRoutes");
 const messageRoutes = require("./routes/messageRoutes");
 const searchRoutes = require("./routes/searchRoutes");
+const mentionRoutes = require("./routes/mentionRoutes");
 const { initSocket } = require("./socket/index");
 const { fanoutQueue, maintenanceQueue, addUnreadFlushJob } = require("./jobs/queue");
 const processMessageFanout = require("./jobs/messageFanout");
@@ -42,6 +43,7 @@ app.use("/conversations", messageRoutes);
 // when the API gateway strips the /conversations prefix.
 app.use("/", messageRoutes);
 app.use("/search", searchRoutes);
+app.use("/mentions", mentionRoutes);
 
 // Initialize Socket.io
 const io = initSocket(server);

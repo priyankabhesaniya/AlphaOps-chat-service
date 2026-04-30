@@ -1,8 +1,7 @@
 const { Conversation, ConversationParticipant, Message, MessageMention, MessageSearchIndex } = require("../models");
 const { getParticipantIds, getCachedUser } = require("../redis/cacheService");
-const { incrementUnreadBulk, isConnected: redisConnected } = require("../redis/unreadService");
 const { userSockets } = require("../socket/userSocketStore");
-const { isConnected } = require("../redis/client");
+const { isConnected, redis } = require("../redis/client");
 const axios = require("axios");
 const { toPlainText } = require("../utils/richText");
 
@@ -60,36 +59,94 @@ async function processMessageFanout(job) {
     }
   } catch (_) { /* non-critical */ }
 
-  // 2. Increment unread counts in Redis (bulk pipeline).
-  // Falls back to direct DB increment when Redis is unavailable so counts
-  // are always updated regardless of Redis availability.
+  // 2+3. Increment unread counts and emit absolute counts to connected recipients.
+  // Sending absolute unread_count (not a delta) makes the event idempotent — duplicate
+  // deliveries (e.g. multiple sockets, reconnect) set the same value instead of doubling.
+  const uidUnreadMap = {}; // uid → new absolute count
   if (recipients.length > 0) {
     if (isConnected()) {
-      await incrementUnreadBulk(recipients, conversation_id);
+      // Guard against queue retries: only increment once per (message, recipient).
+      // If this key already exists, the unread increment for that recipient was already applied.
+      const dedupePipeline = redis.pipeline();
+      recipients.forEach((uid) => {
+        dedupePipeline.set(
+          `unread:applied:${message_id}:${uid}`,
+          "1",
+          "EX",
+          60 * 60 * 24 * 7,
+          "NX"
+        );
+      });
+      const dedupeResults = await dedupePipeline.exec().catch(() => []);
+
+      const recipientsToIncrement = [];
+      recipients.forEach((uid, i) => {
+        const [, dedupeSetResult] = dedupeResults[i] || [];
+        if (dedupeSetResult === "OK") {
+          recipientsToIncrement.push(uid);
+        }
+      });
+
+      if (recipientsToIncrement.length > 0) {
+        // Use pipeline HINCRBY which returns the new value after increment.
+        const pipeline = redis.pipeline();
+        recipientsToIncrement.forEach((uid) => {
+          pipeline.hincrby(`unread:${uid}`, String(conversation_id), 1);
+        });
+        const results = await pipeline.exec().catch(() => []);
+        recipientsToIncrement.forEach((uid, i) => {
+          const [err, count] = results[i] || [null, null];
+          uidUnreadMap[String(uid)] = err ? null : Number(count);
+        });
+      }
+
+      // For recipients skipped by idempotency guard, fetch current absolute count so
+      // clients still receive an authoritative value.
+      const recipientsToFetch = recipients.filter((uid) => !Object.prototype.hasOwnProperty.call(uidUnreadMap, String(uid)));
+      if (recipientsToFetch.length > 0) {
+        const fetchPipeline = redis.pipeline();
+        recipientsToFetch.forEach((uid) => {
+          fetchPipeline.hget(`unread:${uid}`, String(conversation_id));
+        });
+        const fetchResults = await fetchPipeline.exec().catch(() => []);
+        recipientsToFetch.forEach((uid, i) => {
+          const [err, count] = fetchResults[i] || [null, null];
+          uidUnreadMap[String(uid)] = err ? null : Number(count || 0);
+        });
+      }
     } else {
-      // Redis down — write directly to DB
+      // Redis down — write directly to DB and fetch absolute unread counts.
+      // Emitting absolute unread_count keeps client updates idempotent.
       try {
         await ConversationParticipant.increment("unread_count", {
           by: 1,
           where: { conversation_id, user_id: recipients, is_active: 1 },
         });
+
+        const participantUnreadRows = await ConversationParticipant.findAll({
+          where: { conversation_id, user_id: recipients, is_active: 1 },
+          attributes: ["user_id", "unread_count"],
+          raw: true,
+        });
+        participantUnreadRows.forEach((row) => {
+          uidUnreadMap[String(row.user_id)] = Number(row.unread_count || 0);
+        });
       } catch (err) {
         console.error("[fanout] DB unread increment failed:", err.message);
       }
     }
-  }
 
-  // 3. Emit unread:update to connected recipients
-  for (const uid of recipients) {
-    const sockets = userSockets.get(String(uid));
-    if (sockets && sockets.size > 0) {
+    for (const uid of recipients) {
+      const sockets = userSockets.get(String(uid));
+      if (!sockets || sockets.size === 0) continue;
+      const newCount = uidUnreadMap[String(uid)];
+      // Always emit absolute unread_count when available to avoid duplicate client increments.
+      if (!Number.isFinite(newCount)) continue;
+      const payload = { conversation_id, unread_count: newCount };
       for (const socketId of sockets) {
         const socketInstance = global._io?.sockets?.sockets?.get(socketId);
         if (socketInstance) {
-          socketInstance.emit("unread:update", {
-            conversation_id,
-            increment: 1,
-          });
+          socketInstance.emit("unread:update", payload);
         }
       }
     }
