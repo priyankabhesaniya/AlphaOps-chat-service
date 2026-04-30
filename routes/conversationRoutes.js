@@ -25,6 +25,7 @@ router.post("/:id/members", authMiddleware, participantGuard, roleGuard([1, 2]),
 
 // Remove member (admin/owner)
 router.delete("/:id/members/:userId", authMiddleware, participantGuard, roleGuard([1, 2]), conversationController.removeMember);
+router.post("/:id/members/:userId/block", authMiddleware, participantGuard, roleGuard([1, 2]), conversationController.blockMember);
 
 // Change role (owner only for ownership transfer, admin for role changes)
 router.put("/:id/members/:userId/role", authMiddleware, participantGuard, roleGuard([1, 2]), conversationController.changeRole);

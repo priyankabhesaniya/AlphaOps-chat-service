@@ -665,7 +665,62 @@ const addMembers = async (req, res) => {
   }
 };
 
-// DELETE /conversations/:id/members/:userId — remove member
+// POST /conversations/:id/members/:userId/block — block member
+const blockMember = async (req, res) => {
+  try {
+    const { userId: actorId, org_id } = req.user;
+    const { id, userId: targetUserId } = req.params;
+
+    const target = await ConversationParticipant.findOne({
+      where: { conversation_id: id, user_id: targetUserId, org_id, is_active: 1 },
+    });
+    if (!target) {
+      return sendResponse(res, 404, false, "User not in conversation");
+    }
+
+    // Cannot block owner
+    if (target.role === 1) {
+      return sendResponse(res, 400, false, "Cannot block conversation owner");
+    }
+
+    await target.update({ is_active: 0, left_at: new Date() });
+    await invalidateParticipants(id);
+    await leaveUsersFromConversationRoom(id, [targetUserId]);
+    await removeConversationUnread(targetUserId, id);
+
+    const [cachedTarget, cachedActor] = await Promise.all([
+      getCachedUsers([targetUserId]),
+      getCachedUsers([actorId]),
+    ]);
+    const targetName = cachedTarget[targetUserId]?.name || cachedTarget[targetUserId]?.full_name || cachedTarget[targetUserId]?.first_name || `User ${targetUserId}`;
+    const actorName = cachedActor[actorId]?.name || cachedActor[actorId]?.full_name || cachedActor[actorId]?.first_name || `User ${actorId}`;
+    await ConversationActivityLog.create({
+      conversation_id: id, org_id, actor_id: actorId, action: "member_blocked", target_user_id: targetUserId,
+    });
+    const sysMsg = await Message.create({
+      conversation_id: id,
+      org_id,
+      sender_id: actorId,
+      kind: 3,
+      content: `${actorName} blocked ${targetName}`,
+      system_action: "member_blocked",
+    });
+    emitNewMessage(id, sysMsg.toJSON());
+    await fanoutSystemMessage({
+      message: sysMsg,
+      conversation_id: id,
+      org_id,
+      sender_id: actorId,
+      system_action: "member_blocked",
+    });
+
+    sendResponse(res, 200, true, "Member blocked");
+  } catch (error) {
+    console.error("blockMember error:", error.message);
+    sendResponse(res, 500, false, "Failed to block member");
+  }
+};
+
 const removeMember = async (req, res) => {
   try {
     const { userId: actorId, org_id } = req.user;
@@ -842,6 +897,7 @@ module.exports = {
   leaveConversation,
   addMembers,
   removeMember,
+  blockMember,
   changeRole,
   toggleFavorite,
   toggleMute,
