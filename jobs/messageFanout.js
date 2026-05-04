@@ -47,10 +47,8 @@ async function processMessageFanout(job) {
     participantIds = rows.map((r) => r.user_id);
   }
 
-  // Exclude sender from unread recipients
   const recipients = participantIds.filter((id) => Number(id) !== Number(sender_id));
 
-  // Resolve sender name for notification payload (best-effort from Redis cache)
   let senderName = null;
   try {
     const senderUser = await getCachedUser(sender_id);
@@ -59,14 +57,10 @@ async function processMessageFanout(job) {
     }
   } catch (_) { /* non-critical */ }
 
-  // 2+3. Increment unread counts and emit absolute counts to connected recipients.
-  // Sending absolute unread_count (not a delta) makes the event idempotent — duplicate
-  // deliveries (e.g. multiple sockets, reconnect) set the same value instead of doubling.
-  const uidUnreadMap = {}; // uid → new absolute count
+
+  const uidUnreadMap = {};
   if (recipients.length > 0) {
     if (isConnected()) {
-      // Guard against queue retries: only increment once per (message, recipient).
-      // If this key already exists, the unread increment for that recipient was already applied.
       const dedupePipeline = redis.pipeline();
       recipients.forEach((uid) => {
         dedupePipeline.set(

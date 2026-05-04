@@ -16,70 +16,80 @@ const getMessages = async (req, res) => {
     const { userId, org_id } = req.user;
     const { id: conversationId } = req.params;
     const { cursor, limit = 50 } = req.query;
-    const queryLimit = Math.min(parseInt(limit), 100);
+    const queryLimit = Math.min(parseInt(limit, 10) || 50, 100);
+    const fetchLimit = Math.max(queryLimit * 2, 50);
 
-    // Fetch extra rows to account for "deleted for me"
-    const fetchLimit = queryLimit + 5;
-
-    const where = {
+    const baseWhere = {
       conversation_id: conversationId,
       org_id,
     };
 
-    if (cursor) {
-      where.id = { [Op.lt]: parseInt(cursor) };
-    }
+    let lastId = Number.isFinite(Number(cursor)) ? Number(cursor) : undefined;
+    let visibleMessages = [];
+    let hasMore = false;
 
-    const messages = await Message.findAll({
-      where,
-      order: [["id", "DESC"]],
-      limit: fetchLimit,
-      raw: true,
-    });
+    while (visibleMessages.length < queryLimit) {
+      const where = { ...baseWhere };
+      if (lastId) {
+        where.id = { [Op.lt]: lastId };
+      }
 
-    if (messages.length === 0) {
-      return sendResponse(res, 200, true, "Messages", {
-        messages: [],
-        next_cursor: null,
-        has_more: false,
+      const batch = await Message.findAll({
+        where,
+        order: [["id", "DESC"]],
+        limit: fetchLimit,
+        raw: true,
       });
+
+      if (batch.length === 0) {
+        hasMore = false;
+        break;
+      }
+
+      const messageIds = batch.map((m) => m.id);
+      const deletedForMe = await MessageDeletion.findAll({
+        where: { user_id: userId, message_id: { [Op.in]: messageIds } },
+        attributes: ["message_id"],
+        raw: true,
+      });
+      const deletedSet = new Set(deletedForMe.map((d) => d.message_id));
+      const filteredBatch = batch.filter((m) => !deletedSet.has(m.id));
+
+      visibleMessages = visibleMessages.concat(filteredBatch);
+      lastId = batch[batch.length - 1].id;
+
+      if (visibleMessages.length >= queryLimit) {
+        visibleMessages = visibleMessages.slice(0, queryLimit);
+        hasMore = true;
+        break;
+      }
+
+      if (batch.length < fetchLimit) {
+        hasMore = false;
+        break;
+      }
+
+      hasMore = true;
     }
 
-    // Batch-check "deleted for me"
-    const messageIds = messages.map((m) => m.id);
-    const deletedForMe = await MessageDeletion.findAll({
-      where: { user_id: userId, message_id: { [Op.in]: messageIds } },
-      attributes: ["message_id"],
-      raw: true,
-    });
-    const deletedSet = new Set(deletedForMe.map((d) => d.message_id));
+    const resultMessages = visibleMessages.slice(0, queryLimit);
+    const nextCursor = resultMessages.length > 0 ? resultMessages[resultMessages.length - 1].id : null;
 
-    // Filter and trim
-    let filtered = messages.filter((m) => !deletedSet.has(m.id));
-    const hasMore = filtered.length > queryLimit;
-    filtered = filtered.slice(0, queryLimit);
-    const nextCursor = filtered.length > 0 ? filtered[filtered.length - 1].id : null;
-
-    // Batch-load sender info
-    const senderIds = [...new Set(filtered.map((m) => m.sender_id))];
+    const senderIds = [...new Set(resultMessages.map((m) => m.sender_id))];
     const userMap = await getCachedUsers(senderIds);
 
-    // Batch-load reactions
-    const filteredIds = filtered.map((m) => m.id);
-    const reactions = await MessageReaction.findAll({
-      where: { message_id: { [Op.in]: filteredIds } },
-      raw: true,
-    });
+    const filteredIds = resultMessages.map((m) => m.id);
+    const reactions = filteredIds.length > 0
+      ? await MessageReaction.findAll({ where: { message_id: { [Op.in]: filteredIds } }, raw: true })
+      : [];
 
-    // Group reactions by message_id
     const reactionMap = {};
     for (const r of reactions) {
       if (!reactionMap[r.message_id]) reactionMap[r.message_id] = [];
       reactionMap[r.message_id].push(r);
     }
 
-    // Batch-load reply-to messages
-    const replyToIds = [...new Set(filtered.map((m) => m.reply_to_message_id).filter(Boolean))];
+    const replyToIds = [...new Set(resultMessages.map((m) => m.reply_to_message_id).filter(Boolean))];
     let replyToMap = {};
     if (replyToIds.length > 0) {
       const replyMsgs = await Message.findAll({
@@ -92,13 +102,11 @@ const getMessages = async (req, res) => {
       }
     }
 
-    // Assemble result
-    const result = filtered.map((m) => ({
+    const result = resultMessages.map((m) => ({
       ...m,
       sender: userMap[m.sender_id] || null,
       reactions: reactionMap[m.id] || [],
       reply_to_message: m.reply_to_message_id ? (replyToMap[m.reply_to_message_id] || null) : null,
-      // Mask deleted messages
       content: m.is_deleted ? null : m.content,
     }));
 
