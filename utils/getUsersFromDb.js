@@ -21,10 +21,11 @@ async function getAuthSequelize() {
  * Fetch users from auth_db.users table by IDs.
  * Returns { userId: { id, name, email, avatar_url, title, designation, about } }
  */
-async function getUsersFromDb(userIds) {
+async function getUsersFromDb(userIds, orgId = null) {
   if (!userIds || userIds.length === 0) return {};
   try {
     const db = await getAuthSequelize();
+    const orgFilter = orgId ? " AND u.org_id = :orgId" : "";
     const rows = await db.query(
       `SELECT
          u.id,
@@ -40,9 +41,9 @@ async function getUsersFromDb(userIds) {
          ON r.id = u.role_id
         AND r.org_id = u.org_id
         AND r.is_deleted = 0
-       WHERE u.id IN (:ids) AND u.is_deleted = 0`,
+       WHERE u.id IN (:ids) AND u.is_deleted = 0${orgFilter}`,
       {
-        replacements: { ids: userIds },
+        replacements: { ids: userIds, orgId: orgId || undefined },
         type: Sequelize.QueryTypes.SELECT,
       }
     );
@@ -69,4 +70,29 @@ async function getUsersFromDb(userIds) {
   }
 }
 
-module.exports = { getUsersFromDb };
+/**
+ * Fetch ALL active (non-deleted) users for an organization.
+ * Returns an array of user IDs.
+ */
+async function getOrgUserIdsFromDb(orgId) {
+  if (!orgId) return [];
+  try {
+    const db = await getAuthSequelize();
+    const rows = await db.query(
+      `SELECT u.id
+       FROM users u
+       WHERE u.org_id = :orgId
+         AND u.is_deleted = 0`,
+      {
+        replacements: { orgId },
+        type: Sequelize.QueryTypes.SELECT,
+      }
+    );
+    return rows.map((r) => r.id);
+  } catch (err) {
+    console.error("getOrgUserIdsFromDb error:", err.message);
+    return [];
+  }
+}
+
+module.exports = { getUsersFromDb, getOrgUserIdsFromDb };

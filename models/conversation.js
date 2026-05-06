@@ -29,7 +29,12 @@ const Conversation = sequelizeWrite.define('Conversation', {
     type: DataTypes.STRING(500),
     allowNull: true,
   },
-  is_public: {
+  group_type: {
+    type: DataTypes.ENUM('public', 'private'),
+    allowNull: false,
+    defaultValue: 'private',
+  },
+  is_read_only: {
     type: DataTypes.TINYINT(1),
     allowNull: false,
     defaultValue: 0,

@@ -1,4 +1,4 @@
-const { Message, ConversationParticipant, MessageReaction, MessageEdit, MessageDeletion } = require("../models");
+const { Message, Conversation, ConversationParticipant, MessageReaction, MessageEdit, MessageDeletion } = require("../models");
 const { getIdempotencyKey, setIdempotencyKey, getConversationParticipantIds, checkRateLimit, addMessageDelivery, getMessageDeliveries } = require("../redis/cacheService");
 const { addMessageFanoutJob } = require("../jobs/queue");
 const processMessageFanout = require("../jobs/messageFanout");
@@ -61,12 +61,35 @@ function setupMessageHandler(io, socket) {
         file_size_bytes,
         reply_to_message_id,
         parent_message_id,
+        forwarded_from_id,
         mentions,
         client_message_id,
       } = data;
 
       if (!conversation_id) {
         return ack?.({ error: "conversation_id is required" });
+      }
+
+      // Read-only group enforcement (backend source of truth)
+      const conv = await Conversation.findOne({
+        where: { id: conversation_id, org_id: orgId, is_deleted: 0 },
+        attributes: ["id", "type", "is_read_only"],
+        raw: true,
+      });
+      if (!conv) {
+        return ack?.({ error: "Conversation not found" });
+      }
+      if (Number(conv.type) === 2 && Number(conv.is_read_only) === 1) {
+        const me = await ConversationParticipant.findOne({
+          where: { conversation_id, org_id: orgId, user_id: userId, is_active: 1 },
+          attributes: ["role"],
+          raw: true,
+        });
+        const role = Number(me?.role || 0);
+        const isAdmin = role === 1 || role === 2;
+        if (!isAdmin) {
+          return ack?.({ error: "Only admins can send messages in this group" });
+        }
       }
 
       const safeContent = sanitizeRichText(content || "");
@@ -114,6 +137,7 @@ function setupMessageHandler(io, socket) {
         file_type: file_type || null,
         file_size_bytes: file_size_bytes || null,
         reply_to_message_id: reply_to_message_id || null,
+        forwarded_from_id: forwarded_from_id || null,
         client_message_id: client_message_id || null,
       });
 

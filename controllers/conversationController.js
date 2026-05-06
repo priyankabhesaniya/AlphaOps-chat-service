@@ -12,6 +12,7 @@ const { Op } = require("sequelize");
 const { sequelizeWrite } = require("../config/database");
 const { addMessageFanoutJob } = require("../jobs/queue");
 const { getUserSockets } = require("../socket/userSocketStore");
+const { getUsersFromDb, getOrgUserIdsFromDb } = require("../utils/getUsersFromDb");
 
 function emitNewMessage(conversationId, message) {
   try {
@@ -29,7 +30,8 @@ function emitConversationCreatedToUsers(conversation, userIds) {
     type: conversation.type,
     title: conversation.title,
     avatar_url: conversation.avatar_url,
-    is_public: conversation.is_public,
+    group_type: conversation.group_type,
+    is_read_only: conversation.is_read_only,
     allow_read_receipts: conversation.allow_read_receipts,
     last_message_id: conversation.last_message_id,
     last_message_at: conversation.last_message_at ? conversation.last_message_at.toISOString() : null,
@@ -127,7 +129,7 @@ const getConversations = async (req, res) => {
           as: "conversation",
           where: { is_deleted: 0 },
           attributes: [
-            "id", "type", "title", "avatar_url", "is_public",
+            "id", "type", "title", "avatar_url", "group_type", "is_read_only",
             "allow_read_receipts",
             "last_message_id", "last_message_at",
             "last_message_preview", "last_message_sender_id",
@@ -248,7 +250,26 @@ const createConversation = async (req, res) => {
   const t = await sequelizeWrite.transaction();
   try {
     const { userId, org_id } = req.user;
-    const { type, title, description, participant_ids = [], avatar_url } = req.body;
+    const {
+      type,
+      title,
+      description,
+      avatar_url,
+      groupType,
+      group_type,
+      is_read_only,
+    } = req.body;
+
+    // Accept both legacy and new keys from frontend
+    const rawParticipants =
+      req.body.participants ||
+      req.body.participant_ids ||
+      req.body["participants[]"] ||
+      [];
+
+    const participant_ids = Array.isArray(rawParticipants)
+      ? rawParticipants
+      : (rawParticipants ? [rawParticipants] : []);
 
     if (!type || ![1, 2].includes(type)) {
       return sendResponse(res, 400, false, "Invalid conversation type (1=dm, 2=group)");
@@ -287,9 +308,19 @@ const createConversation = async (req, res) => {
       }
     }
 
-    // Group: at least 1 other participant
-    if (type === 2 && participant_ids.length < 1) {
-      return sendResponse(res, 400, false, "Group requires at least one other participant");
+    // Group validations + defaults
+    const resolvedGroupType = String(groupType || group_type || "private").toLowerCase();
+    const resolvedReadOnly = Boolean(is_read_only === true || is_read_only === 1 || is_read_only === "1" || is_read_only === "true");
+    if (type === 2) {
+      if (!title || !String(title).trim()) {
+        return sendResponse(res, 400, false, "title is required for group");
+      }
+      if (!["public", "private"].includes(resolvedGroupType)) {
+        return sendResponse(res, 400, false, "Invalid groupType (public|private)");
+      }
+      if (resolvedGroupType === "private" && participant_ids.length < 1) {
+        return sendResponse(res, 400, false, "Private group requires at least one other participant");
+      }
     }
 
     // Create conversation
@@ -300,20 +331,72 @@ const createConversation = async (req, res) => {
         title: type === 2 ? title : null,
         description: type === 2 ? description : null,
         avatar_url: type === 2 ? avatar_url : null,
+        group_type: type === 2 ? resolvedGroupType : "private",
+        is_read_only: type === 2 ? (resolvedReadOnly ? 1 : 0) : 0,
         created_by: userId,
       },
       { transaction: t }
     );
 
     // Add creator as owner
-    const allParticipantIds = [userId, ...participant_ids.filter((id) => id !== userId)];
-    const participantRows = allParticipantIds.map((uid, idx) => ({
+    let allParticipantIds = [];
+
+    if (type === 2 && resolvedGroupType === "public") {
+      // PUBLIC GROUP: backend is source of truth, auto-include all org users (non-deleted)
+      allParticipantIds = await getOrgUserIdsFromDb(org_id);
+    } else {
+      // PRIVATE GROUP or DM: use provided participants
+      allParticipantIds = participant_ids.map((id) => parseInt(id, 10)).filter((n) => Number.isFinite(n));
+    }
+
+    // Always include creator, de-dup
+    allParticipantIds = Array.from(new Set([userId, ...allParticipantIds].map((n) => parseInt(n, 10)).filter((n) => Number.isFinite(n))));
+
+    // Validate org consistency via auth-db (source of truth).
+    if (type === 2) {
+      const idSet = Array.from(new Set(allParticipantIds));
+      const userMap = await getUsersFromDb(idSet, org_id);
+      const validSet = new Set(Object.keys(userMap).map(String));
+
+      // Ensure creator exists/active in org
+      if (!validSet.has(String(userId))) {
+        await t.rollback();
+        return sendResponse(res, 400, false, "Creator is not an active user in this organization");
+      }
+
+      const invalid = idSet.filter((id) => !validSet.has(String(id)));
+      if (invalid.length) {
+        await t.rollback();
+        return sendResponse(res, 400, false, `Invalid participants for org: ${invalid.slice(0, 10).join(", ")}`);
+      }
+
+      // For private groups, require at least one other participant
+      if (resolvedGroupType === "private") {
+        const others = idSet.filter((id) => String(id) !== String(userId));
+        if (others.length < 1) {
+          await t.rollback();
+          return sendResponse(res, 400, false, "Private group requires at least one other participant");
+        }
+      }
+
+      allParticipantIds = idSet;
+    }
+
+    // Default everyone to member; ensure ONLY creator is owner
+    const participantRows = allParticipantIds.map((uid) => ({
       conversation_id: conversation.id,
       user_id: uid,
       org_id,
-      role: idx === 0 ? 1 : 3, // first = owner, rest = member
+      role: 3,
       joined_at: new Date(),
     }));
+
+    // Ensure creator is owner/admin
+    for (const row of participantRows) {
+      if (String(row.user_id) === String(userId)) {
+        row.role = 1;
+      }
+    }
 
     await ConversationParticipant.bulkCreate(participantRows, { transaction: t });
 
@@ -354,7 +437,8 @@ const createConversation = async (req, res) => {
       type: conversation.type,
       title: conversation.type === 1 ? null : conversation.title,
       avatar_url: conversation.type === 1 ? null : conversation.avatar_url,
-      is_public: conversation.is_public,
+      group_type: conversation.group_type,
+      is_read_only: conversation.is_read_only,
       allow_read_receipts: conversation.allow_read_receipts,
       last_message_id: null,
       last_message_at: conversation.created_at ? conversation.created_at.toISOString() : null,
@@ -465,7 +549,7 @@ const updateConversation = async (req, res) => {
   try {
     const { org_id, userId } = req.user;
     const { id } = req.params;
-    const { title, description, avatar_url, is_public, allow_read_receipts } = req.body;
+    const { title, description, avatar_url, allow_read_receipts, groupType, group_type, is_read_only } = req.body;
 
     const conversation = await Conversation.findOne({
       where: { id, org_id, type: 2, is_deleted: 0 },
@@ -478,7 +562,11 @@ const updateConversation = async (req, res) => {
     if (title !== undefined) updates.title = title;
     if (description !== undefined) updates.description = description;
     if (avatar_url !== undefined) updates.avatar_url = avatar_url;
-    if (is_public !== undefined) updates.is_public = is_public ? 1 : 0;
+    if (groupType !== undefined || group_type !== undefined) {
+      const gt = String(groupType || group_type || "").toLowerCase();
+      if (["public", "private"].includes(gt)) updates.group_type = gt;
+    }
+    if (is_read_only !== undefined) updates.is_read_only = (is_read_only === true || is_read_only === 1 || is_read_only === "1" || is_read_only === "true") ? 1 : 0;
     if (allow_read_receipts !== undefined) updates.allow_read_receipts = allow_read_receipts ? 1 : 0;
 
     await conversation.update(updates);
