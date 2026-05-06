@@ -70,6 +70,92 @@ async function fanoutSystemMessage({ message, conversation_id, org_id, sender_id
   });
 }
 
+async function broadcastSystemMessages(conversationId, org_id, sender_id, sysMessages) {
+  const list = Array.isArray(sysMessages) ? sysMessages.filter(Boolean) : (sysMessages ? [sysMessages] : []);
+  for (const m of list) {
+    emitNewMessage(conversationId, typeof m?.toJSON === "function" ? m.toJSON() : m);
+    await fanoutSystemMessage({
+      message: m,
+      conversation_id: conversationId,
+      org_id,
+      sender_id,
+      system_action: m.system_action,
+    });
+  }
+}
+
+async function createMemberAddedSystemMessages({
+  conversationId,
+  org_id,
+  actorId,
+  targetUserIds,
+  transaction,
+  combine = true,
+}) {
+  const ids = (Array.isArray(targetUserIds) ? targetUserIds : [targetUserIds])
+    .map((n) => parseInt(n, 10))
+    .filter((n) => Number.isFinite(n))
+    .filter((n) => String(n) !== String(actorId));
+
+  if (ids.length === 0) return [];
+
+  const [cachedUsers, cachedActor] = await Promise.all([
+    getCachedUsers(ids),
+    getCachedUsers([actorId]),
+  ]);
+  const actorName =
+    cachedActor[actorId]?.name
+    || cachedActor[actorId]?.full_name
+    || cachedActor[actorId]?.first_name
+    || `User ${actorId}`;
+
+  for (const uid of ids) {
+    await ConversationActivityLog.create(
+      { conversation_id: conversationId, org_id, actor_id: actorId, action: "member_added", target_user_id: uid },
+      { transaction }
+    );
+  }
+
+  const resolveName = (uid) =>
+    cachedUsers[uid]?.name
+    || cachedUsers[uid]?.full_name
+    || cachedUsers[uid]?.first_name
+    || `User ${uid}`;
+
+  if (combine) {
+    const nameList = ids.map(resolveName).join(", ");
+    const sysMsg = await Message.create(
+      {
+        conversation_id: conversationId,
+        org_id,
+        sender_id: actorId,
+        kind: 3,
+        content: `${actorName} added ${nameList}`,
+        system_action: "member_added",
+      },
+      { transaction }
+    );
+    return [sysMsg];
+  }
+
+  const out = [];
+  for (const uid of ids) {
+    const sysMsg = await Message.create(
+      {
+        conversation_id: conversationId,
+        org_id,
+        sender_id: actorId,
+        kind: 3,
+        content: `${actorName} added ${resolveName(uid)}`,
+        system_action: "member_added",
+      },
+      { transaction }
+    );
+    out.push(sysMsg);
+  }
+  return out;
+}
+
 async function joinUsersToConversationRoom(conversationId, userIds) {
   const io = global._io;
   if (!io || !Array.isArray(userIds) || userIds.length === 0) return;
@@ -401,18 +487,42 @@ const createConversation = async (req, res) => {
     await ConversationParticipant.bulkCreate(participantRows, { transaction: t });
 
     // System message for group creation
+    let createdSysMsg = null;
+    let memberAddedSysMsgs = [];
     if (type === 2) {
-      await Message.create(
+      const cachedActor = await getCachedUsers([userId]);
+      const actorName =
+        cachedActor[userId]?.name
+        || cachedActor[userId]?.full_name
+        || cachedActor[userId]?.first_name
+        || `User ${userId}`;
+
+      createdSysMsg = await Message.create(
         {
           conversation_id: conversation.id,
           org_id,
           sender_id: userId,
           kind: 3,
-          content: null,
+          content: `${actorName} created group`,
           system_action: "created_group",
         },
         { transaction: t }
       );
+
+      // During creation we add participants in one request; to match the existing UX
+      // of "add member" actions, we generate member_added system messages here too.
+      const initialAddedIds = allParticipantIds.filter((id) => String(id) !== String(userId));
+      if (initialAddedIds.length > 0) {
+        const perUser = resolvedGroupType === "private";
+        memberAddedSysMsgs = await createMemberAddedSystemMessages({
+          conversationId: conversation.id,
+          org_id,
+          actorId: userId,
+          targetUserIds: initialAddedIds,
+          transaction: t,
+          combine: !perUser,
+        });
+      }
 
       await ConversationActivityLog.create(
         {
@@ -430,6 +540,10 @@ const createConversation = async (req, res) => {
     // Cache participant IDs and ensure live sockets join the new conversation room.
     await setParticipantIds(conversation.id, allParticipantIds);
     await joinUsersToConversationRoom(conversation.id, allParticipantIds);
+
+    if (type === 2) {
+      await broadcastSystemMessages(conversation.id, org_id, userId, [createdSysMsg, ...memberAddedSysMsgs]);
+    }
 
     // Send a live event for active sockets so newly added/created conversations appear immediately.
     const eventPayload = {
@@ -689,32 +803,14 @@ const addMembers = async (req, res) => {
       }
     }
 
-    const cachedUsers = await getCachedUsers(newUserIds);
-    const cachedActor = await getCachedUsers([userId]);
-    const actorName = cachedActor[userId]?.name || cachedActor[userId]?.full_name || cachedActor[userId]?.first_name || `User ${userId}`;
-
-    // Activity log per member (audit), but one combined system message
-    for (const uid of newUserIds) {
-      await ConversationActivityLog.create(
-        { conversation_id: id, org_id, actor_id: userId, action: "member_added", target_user_id: uid },
-        { transaction: t }
-      );
-    }
-
-    const nameList = newUserIds
-      .map((uid) => cachedUsers[uid]?.name || cachedUsers[uid]?.full_name || cachedUsers[uid]?.first_name || `User ${uid}`)
-      .join(", ");
-    const sysMsg = await Message.create(
-      {
-        conversation_id: id,
-        org_id,
-        sender_id: userId,
-        kind: 3,
-        content: `${actorName} added ${nameList}`,
-        system_action: "member_added",
-      },
-      { transaction: t }
-    );
+    const [sysMsg] = await createMemberAddedSystemMessages({
+      conversationId: id,
+      org_id,
+      actorId: userId,
+      targetUserIds: newUserIds,
+      transaction: t,
+      combine: true,
+    });
 
     await t.commit();
     await invalidateParticipants(id);
@@ -736,14 +832,7 @@ const addMembers = async (req, res) => {
       newUserIds
     );
 
-    emitNewMessage(id, sysMsg.toJSON());
-    await fanoutSystemMessage({
-      message: sysMsg,
-      conversation_id: id,
-      org_id,
-      sender_id: userId,
-      system_action: "member_added",
-    });
+    await broadcastSystemMessages(id, org_id, userId, [sysMsg]);
 
     sendResponse(res, 200, true, "Members added", { added: newUserIds });
   } catch (error) {
