@@ -57,6 +57,15 @@ async function reconcilePendingDeliveries(io, userId, orgId, participations) {
         await addMessageDelivery(msg.id, delivery, convId, orgId);
         // Notify senders by broadcasting the updated delivery state to the room
         await sendDeliveredEvent(io, convId, msg.id, recipientCount);
+        // Replay full payload so the reconnecting recipient hydrates Redux without waiting for HTTP fetch
+        try {
+          const fullRow = await Message.findByPk(msg.id);
+          if (fullRow) {
+            io.to(`user:${userId}`).emit("message:new", fullRow.toJSON());
+          }
+        } catch (_e) {
+          /* non-critical */
+        }
       }
     } catch (err) {
       console.error(`[reconcile] conv ${convId}:`, err.message);

@@ -10,12 +10,49 @@ const { sendResponse } = require("../utils/responseUtils");
 const { getCachedUsers, getMessageDeliveries } = require("../redis/cacheService");
 const { Op } = require("sequelize");
 
-// GET /conversations/:id/messages — cursor-based pagination
+async function formatMessageRowsForClient(resultMessages, org_id) {
+  const senderIds = [...new Set(resultMessages.map((m) => m.sender_id))];
+  const userMap = await getCachedUsers(senderIds, org_id);
+
+  const filteredIds = resultMessages.map((m) => m.id);
+  const reactions = filteredIds.length > 0
+    ? await MessageReaction.findAll({ where: { message_id: { [Op.in]: filteredIds } }, raw: true })
+    : [];
+
+  const reactionMap = {};
+  for (const r of reactions) {
+    if (!reactionMap[r.message_id]) reactionMap[r.message_id] = [];
+    reactionMap[r.message_id].push(r);
+  }
+
+  const replyToIds = [...new Set(resultMessages.map((m) => m.reply_to_message_id).filter(Boolean))];
+  let replyToMap = {};
+  if (replyToIds.length > 0) {
+    const replyMsgs = await Message.findAll({
+      where: { id: { [Op.in]: replyToIds } },
+      attributes: ["id", "sender_id", "content", "kind"],
+      raw: true,
+    });
+    for (const rm of replyMsgs) {
+      replyToMap[rm.id] = rm;
+    }
+  }
+
+  return resultMessages.map((m) => ({
+    ...m,
+    sender: userMap[m.sender_id] || null,
+    reactions: reactionMap[m.id] || [],
+    reply_to_message: m.reply_to_message_id ? (replyToMap[m.reply_to_message_id] || null) : null,
+    content: m.is_deleted ? null : m.content,
+  }));
+}
+
+// GET /conversations/:id/messages — cursor-based pagination (+ optional since_id delta)
 const getMessages = async (req, res) => {
   try {
     const { userId, org_id } = req.user;
     const { id: conversationId } = req.params;
-    const { cursor, limit = 50 } = req.query;
+    const { cursor, since_id, limit = 50 } = req.query;
     const queryLimit = Math.min(parseInt(limit, 10) || 50, 100);
     const fetchLimit = Math.max(queryLimit * 2, 50);
 
@@ -32,6 +69,74 @@ const getMessages = async (req, res) => {
       conversation_id: conversationId,
       org_id,
     };
+
+    const sinceRaw = since_id;
+    const cursorRaw = cursor;
+    const hasSince =
+      sinceRaw !== undefined && sinceRaw !== null && sinceRaw !== ""
+      && (cursorRaw === undefined || cursorRaw === null || cursorRaw === "");
+
+    if (hasSince) {
+      const sinceNum = parseInt(String(sinceRaw).trim(), 10);
+      if (!Number.isFinite(sinceNum) || sinceNum < 0) {
+        return sendResponse(res, 400, false, "Invalid since_id");
+      }
+
+      let lowerBound = sinceNum;
+      if (hiddenLastMessageId != null && hiddenLastMessageId !== "") {
+        lowerBound = Math.max(sinceNum, Number(hiddenLastMessageId));
+      }
+
+      let visibleMessages = [];
+      let lastCursorUpper = null;
+
+      while (visibleMessages.length < queryLimit) {
+        const where = { ...baseWhere };
+        if (lastCursorUpper == null) {
+          where.id = { [Op.gt]: lowerBound };
+        } else {
+          where.id = { [Op.and]: [{ [Op.gt]: lowerBound }, { [Op.lt]: lastCursorUpper }] };
+        }
+
+        const batch = await Message.findAll({
+          where,
+          order: [["id", "DESC"]],
+          limit: fetchLimit,
+          raw: true,
+        });
+
+        if (batch.length === 0) break;
+
+        const messageIds = batch.map((m) => m.id);
+        const deletedForMe = await MessageDeletion.findAll({
+          where: { user_id: userId, message_id: { [Op.in]: messageIds } },
+          attributes: ["message_id"],
+          raw: true,
+        });
+        const deletedSet = new Set(deletedForMe.map((d) => d.message_id));
+        const filteredBatch = batch.filter((m) => !deletedSet.has(m.id));
+
+        visibleMessages = visibleMessages.concat(filteredBatch);
+        lastCursorUpper = batch[batch.length - 1].id;
+
+        if (visibleMessages.length >= queryLimit) {
+          visibleMessages = visibleMessages.slice(0, queryLimit);
+          break;
+        }
+
+        if (batch.length < fetchLimit) break;
+      }
+
+      const resultMessages = visibleMessages.slice(0, queryLimit);
+      const result = await formatMessageRowsForClient(resultMessages, org_id);
+
+      sendResponse(res, 200, true, "Messages", {
+        messages: result,
+        next_cursor: null,
+        has_more: false,
+      });
+      return;
+    }
 
     let lastId = Number.isFinite(Number(cursor)) ? Number(cursor) : undefined;
     let visibleMessages = [];
@@ -88,40 +193,7 @@ const getMessages = async (req, res) => {
     const resultMessages = visibleMessages.slice(0, queryLimit);
     const nextCursor = resultMessages.length > 0 ? resultMessages[resultMessages.length - 1].id : null;
 
-    const senderIds = [...new Set(resultMessages.map((m) => m.sender_id))];
-    const userMap = await getCachedUsers(senderIds, org_id);
-
-    const filteredIds = resultMessages.map((m) => m.id);
-    const reactions = filteredIds.length > 0
-      ? await MessageReaction.findAll({ where: { message_id: { [Op.in]: filteredIds } }, raw: true })
-      : [];
-
-    const reactionMap = {};
-    for (const r of reactions) {
-      if (!reactionMap[r.message_id]) reactionMap[r.message_id] = [];
-      reactionMap[r.message_id].push(r);
-    }
-
-    const replyToIds = [...new Set(resultMessages.map((m) => m.reply_to_message_id).filter(Boolean))];
-    let replyToMap = {};
-    if (replyToIds.length > 0) {
-      const replyMsgs = await Message.findAll({
-        where: { id: { [Op.in]: replyToIds } },
-        attributes: ["id", "sender_id", "content", "kind"],
-        raw: true,
-      });
-      for (const rm of replyMsgs) {
-        replyToMap[rm.id] = rm;
-      }
-    }
-
-    const result = resultMessages.map((m) => ({
-      ...m,
-      sender: userMap[m.sender_id] || null,
-      reactions: reactionMap[m.id] || [],
-      reply_to_message: m.reply_to_message_id ? (replyToMap[m.reply_to_message_id] || null) : null,
-      content: m.is_deleted ? null : m.content,
-    }));
+    const result = await formatMessageRowsForClient(resultMessages, org_id);
 
     sendResponse(res, 200, true, "Messages", {
       messages: result,
