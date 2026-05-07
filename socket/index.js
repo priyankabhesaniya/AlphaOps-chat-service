@@ -74,31 +74,31 @@ function initSocket(server) {
 
   // Redis adapter for horizontal scaling (optional)
   try {
-    if (isConnected()) {
-      const { createAdapter } = require("@socket.io/redis-adapter");
-      const pubClient = redis.duplicate();
-      const subClient = redis.duplicate();
+    // IMPORTANT: don't gate adapter setup on isConnected().
+    // Redis client uses lazyConnect, so isConnected() is often false during startup
+    // even when Redis is available, which would incorrectly disable the adapter.
+    const { createAdapter } = require("@socket.io/redis-adapter");
+    const pubClient = redis.duplicate();
+    const subClient = redis.duplicate();
 
-      Promise.all([
-        new Promise((resolve, reject) => {
-          pubClient.on("connect", resolve);
-          pubClient.on("error", reject);
-        }),
-        new Promise((resolve, reject) => {
-          subClient.on("connect", resolve);
-          subClient.on("error", reject);
-        }),
-      ])
-        .then(() => {
-          io.adapter(createAdapter(pubClient, subClient));
-          console.log("Socket.io Redis adapter connected");
-        })
-        .catch((err) => {
-          console.warn("Socket.io Redis adapter failed, running single-instance:", err.message);
-        });
-    } else {
-      console.log("Socket.io running without Redis adapter (single-instance mode)");
-    }
+    // Avoid noisy/unhandled errors when Redis is down.
+    // If adapter connect fails we continue in single-instance mode.
+    pubClient.on("error", () => {});
+    subClient.on("error", () => {});
+
+    Promise.all([
+      pubClient.connect(),
+      subClient.connect(),
+    ])
+      .then(() => {
+        io.adapter(createAdapter(pubClient, subClient));
+        console.log("Socket.io Redis adapter connected");
+      })
+      .catch((err) => {
+        console.warn("Socket.io Redis adapter failed, running single-instance:", err.message);
+        try { pubClient.disconnect(); } catch (_) {}
+        try { subClient.disconnect(); } catch (_) {}
+      });
   } catch (err) {
     console.warn("Socket.io Redis adapter init error:", err.message);
   }

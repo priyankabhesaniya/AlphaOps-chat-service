@@ -814,16 +814,31 @@ const deleteConversationForAll = async (req, res) => {
     const userIds = participantRows.map((r) => r.user_id);
 
     await invalidateParticipants(id);
-    await leaveUsersFromConversationRoom(id, userIds);
 
     try {
-      global._io?.to?.(`conv:${id}`)?.emit?.("conversation:deleted_all", {
+      const payload = {
         conversation_id: id,
         deleted_by: userId,
-      });
+      };
+
+      if (process.env.CHAT_DEBUG_SOCKET === "1") {
+        console.log("[chat] deleted_all emit", { conversation_id: id, user_count: userIds.length });
+      }
+
+      // Emit to the conversation room (for clients still subscribed)
+      global._io?.to?.(`conv:${id}`)?.emit?.("conversation:deleted_all", payload);
+
+      // Adapter-safe: also emit directly to each participant's user room.
+      // This guarantees delivery even if the client left the conv room via rooms:sync.
+      for (const uid of userIds) {
+        global._io?.to?.(`user:${uid}`)?.emit?.("conversation:deleted_all", payload);
+      }
     } catch (_err) {
       // best effort
     }
+
+    // Leave rooms after emitting so connected clients don't miss the event.
+    await leaveUsersFromConversationRoom(id, userIds);
 
     sendResponse(res, 200, true, "Conversation deleted for all");
   } catch (error) {

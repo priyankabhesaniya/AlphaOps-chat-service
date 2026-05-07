@@ -1,8 +1,6 @@
 const Redis = require("ioredis");
 
-const redis = new Redis({
-  host: process.env.REDIS_HOST || "localhost",
-  port: process.env.REDIS_PORT || 6379,
+const baseOptions = {
   connectTimeout: 5000,
   maxRetriesPerRequest: null,
   lazyConnect: true,
@@ -10,7 +8,18 @@ const redis = new Redis({
     if (times > 10) return null; // stop retrying after 10 attempts
     return Math.min(times * 500, 5000);
   },
-});
+};
+
+// Prefer REDIS_URL when provided (matches Bull queue config),
+// fallback to host/port for local dev.
+const redisUrl = process.env.REDIS_URL;
+const redis = redisUrl
+  ? new Redis(String(redisUrl), baseOptions)
+  : new Redis({
+    host: process.env.REDIS_HOST || "localhost",
+    port: process.env.REDIS_PORT || 6379,
+    ...baseOptions,
+  });
 
 let isRedisConnected = false;
 
