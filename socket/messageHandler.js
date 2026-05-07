@@ -1,8 +1,10 @@
 const { Message, Conversation, ConversationParticipant, MessageReaction, MessageEdit, MessageDeletion } = require("../models");
-const { getIdempotencyKey, setIdempotencyKey, getConversationParticipantIds, checkRateLimit, addMessageDelivery, getMessageDeliveries } = require("../redis/cacheService");
+const { getIdempotencyKey, setIdempotencyKey, getConversationParticipantIds, checkRateLimit, addMessageDelivery, getMessageDeliveries, getHydratedUser } = require("../redis/cacheService");
 const { addMessageFanoutJob } = require("../jobs/queue");
 const processMessageFanout = require("../jobs/messageFanout");
 const { sanitizeRichText, toPlainText } = require("../utils/richText");
+const { getUserSockets } = require("./userSocketStore");
+const { Op } = require("sequelize");
 
 const MESSAGE_KIND = { TEXT: 1, FILE: 2, SYSTEM: 3 };
 
@@ -45,6 +47,11 @@ async function sendDeliveredEvent(io, conversationId, messageId, recipientCount)
   });
 }
 
+async function emitConversationCreatedToUser(io, userId, payload) {
+  // Adapter-safe: per-user room works across instances
+  io?.to?.(`user:${userId}`)?.emit?.("conversation:created", payload);
+}
+
 function setupMessageHandler(io, socket) {
   const { userId, orgId } = socket;
 
@@ -79,13 +86,19 @@ function setupMessageHandler(io, socket) {
       if (!conv) {
         return ack?.({ error: "Conversation not found" });
       }
+
+      // Participant enforcement (left/kicked users can't send)
+      const membership = await ConversationParticipant.findOne({
+        where: { conversation_id, org_id: orgId, user_id: userId, is_active: 1 },
+        attributes: ["role"],
+        raw: true,
+      });
+      if (!membership) {
+        return ack?.({ error: "You are not a participant of this conversation" });
+      }
+
       if (Number(conv.type) === 2 && Number(conv.is_read_only) === 1) {
-        const me = await ConversationParticipant.findOne({
-          where: { conversation_id, org_id: orgId, user_id: userId, is_active: 1 },
-          attributes: ["role"],
-          raw: true,
-        });
-        const role = Number(me?.role || 0);
+        const role = Number(membership?.role || 0);
         const isAdmin = role === 1 || role === 2;
         if (!isAdmin) {
           return ack?.({ error: "Only admins can send messages in this group" });
@@ -153,6 +166,111 @@ function setupMessageHandler(io, socket) {
 
       // Emit to conversation room
       io.to(`conv:${conversation_id}`).emit("message:new", msgData);
+
+      // Restore hidden conversations immediately (do not depend on async fanout worker).
+      // This ensures the DM reappears in the sidebar without refresh.
+      setImmediate(async () => {
+        try {
+          // Find recipients who have this conversation hidden.
+          const hiddenRows = await ConversationParticipant.findAll({
+            where: {
+              conversation_id,
+              org_id: orgId,
+              is_active: 1,
+              user_id: { [Op.ne]: userId },
+              hidden_last_message_id: { [Op.not]: null, [Op.lt]: message.id },
+            },
+            attributes: ["user_id", "role", "is_favorite", "is_muted"],
+            raw: true,
+          });
+
+          if (!hiddenRows || hiddenRows.length === 0) return;
+
+          const hiddenUserIds = hiddenRows.map((r) => r.user_id);
+          await ConversationParticipant.update(
+            { hidden_last_message_id: null, hidden_at: null },
+            { where: { conversation_id, org_id: orgId, user_id: hiddenUserIds } }
+          );
+
+          const convRow = await Conversation.findOne({
+            where: { id: conversation_id, org_id: orgId, is_deleted: 0 },
+            attributes: [
+              "id",
+              "type",
+              "title",
+              "avatar_url",
+              "group_type",
+              "is_read_only",
+              "allow_read_receipts",
+              "last_message_id",
+              "last_message_at",
+              "last_message_preview",
+              "last_message_sender_id",
+              "created_by",
+              "created_at",
+            ],
+            raw: true,
+          });
+          if (!convRow) return;
+
+          // For correctness, emit a hydrated payload (DM title/avatar from other user)
+          // similar to the fanout job’s restore payload.
+          const participantIdsForMembers = await getConversationParticipantIds(conversation_id, orgId);
+          const lastSender = convRow.last_message_sender_id
+            ? await getHydratedUser(convRow.last_message_sender_id, orgId).catch(() => null)
+            : null;
+
+          for (const row of hiddenRows) {
+            const uid = row.user_id;
+            let title = convRow.title;
+            let avatarUrl = convRow.avatar_url;
+            let otherUserId = null;
+            let otherUser = null;
+
+            if (Number(convRow.type) === 1) {
+              otherUserId = participantIdsForMembers.find((id) => String(id) !== String(uid)) || null;
+              if (otherUserId) {
+                otherUser = await getHydratedUser(otherUserId, orgId);
+                title = otherUser?.name || otherUser?.full_name || otherUser?.first_name || `User ${otherUserId}`;
+                avatarUrl = otherUser?.avatar_url || null;
+              } else {
+                title = "Chat";
+                avatarUrl = null;
+              }
+            }
+
+            const payload = {
+              id: convRow.id,
+              type: convRow.type,
+              title,
+              avatar_url: avatarUrl,
+              group_type: convRow.group_type,
+              is_read_only: convRow.is_read_only,
+              allow_read_receipts: convRow.allow_read_receipts,
+              last_message_id: convRow.last_message_id,
+              last_message_at: convRow.last_message_at ? new Date(convRow.last_message_at).toISOString() : null,
+              last_message_preview: convRow.last_message_preview,
+              last_message_sender_id: convRow.last_message_sender_id,
+              created_by: convRow.created_by,
+              created_at: convRow.created_at ? new Date(convRow.created_at).toISOString() : null,
+              role: row.role,
+              is_favorite: row.is_favorite,
+              is_muted: row.is_muted,
+              last_read_message_id: null,
+              unread_count: null,
+              last_message_sender: lastSender || null,
+              other_user_id: otherUserId,
+              other_user: otherUser || null,
+              participant_count: participantIdsForMembers.length,
+              members: participantIdsForMembers,
+            };
+
+            await emitConversationCreatedToUser(io, uid, payload);
+          }
+        } catch (err) {
+          console.error("[messageHandler] immediate restore failed:", err.message);
+        }
+      });
 
       // Collect online recipients from room and mark them as delivered immediately
       const deliveredTo = await collectDeliveredRecipients(io, conversation_id, userId);

@@ -22,6 +22,17 @@ function emitNewMessage(conversationId, message) {
   }
 }
 
+function emitConversationRemovedToUser({ userId, conversationId, reason }) {
+  try {
+    global._io?.to?.(`user:${userId}`)?.emit?.("conversation:removed", {
+      conversation_id: conversationId,
+      reason: reason || "removed",
+    });
+  } catch (_e) {
+    // best effort
+  }
+}
+
 function emitConversationCreatedToUsers(conversation, userIds) {
   if (!Array.isArray(userIds) || userIds.length === 0) return;
 
@@ -208,7 +219,17 @@ const getConversations = async (req, res) => {
     const offset = (parseInt(page) - 1) * parseInt(limit);
 
     const participants = await ConversationParticipant.findAll({
-      where: { user_id: userId, org_id, is_active: 1 },
+      where: {
+        user_id: userId,
+        org_id,
+        is_active: 1,
+        [Op.and]: [
+          // Hide conversations that the user soft-deleted, until a new message arrives.
+          sequelizeWrite.literal(
+            "(`ConversationParticipant`.`hidden_last_message_id` IS NULL OR `conversation`.`last_message_id` > `ConversationParticipant`.`hidden_last_message_id`)"
+          ),
+        ],
+      },
       include: [
         {
           model: Conversation,
@@ -223,7 +244,16 @@ const getConversations = async (req, res) => {
           ],
         },
       ],
-      attributes: ["conversation_id", "role", "is_favorite", "is_muted", "last_read_message_id", "unread_count"],
+      attributes: [
+        "conversation_id",
+        "role",
+        "is_favorite",
+        "is_muted",
+        "last_read_message_id",
+        "unread_count",
+        "hidden_last_message_id",
+        "hidden_at",
+      ],
       order: [
         ["is_favorite", "DESC"],
         [sequelizeWrite.literal("CASE WHEN `conversation`.`last_message_at` IS NULL THEN 1 ELSE 0 END"), "ASC"],
@@ -703,6 +733,180 @@ const updateConversation = async (req, res) => {
   }
 };
 
+// DELETE /conversations/:id/hide — per-user soft delete (hide until new messages arrive)
+const hideConversation = async (req, res) => {
+  try {
+    const { userId, org_id } = req.user;
+    const { id } = req.params;
+
+    const conversation = await Conversation.findOne({
+      where: { id, org_id, is_deleted: 0 },
+      attributes: ["id", "last_message_id"],
+      raw: true,
+    });
+    if (!conversation) {
+      return sendResponse(res, 404, false, "Conversation not found");
+    }
+
+    const participant = await ConversationParticipant.findOne({
+      where: { conversation_id: id, user_id: userId, org_id, is_active: 1 },
+    });
+    if (!participant) {
+      return sendResponse(res, 404, false, "Not a participant");
+    }
+
+    // IMPORTANT: keep this NON-NULL so auto-restore logic (fanout) can detect
+    // hidden_last_message_id < new_message_id and emit conversation:created.
+    // When a conversation has no last_message_id yet, use 0 as the watermark.
+    const lastMessageId = conversation.last_message_id != null ? conversation.last_message_id : 0;
+    const now = new Date();
+
+    await participant.update({
+      hidden_last_message_id: lastMessageId,
+      hidden_at: now,
+      // Ensure unread starts from NEW messages only.
+      last_read_message_id: lastMessageId,
+      last_read_at: now,
+      unread_count: 0,
+    });
+
+    await removeConversationUnread(userId, id);
+    emitConversationRemovedToUser({ userId, conversationId: id, reason: "hidden" });
+
+    sendResponse(res, 200, true, "Conversation hidden");
+  } catch (error) {
+    console.error("hideConversation error:", error.message);
+    sendResponse(res, 500, false, "Failed to hide conversation");
+  }
+};
+
+// DELETE /conversations/:id/all — admin/owner global soft delete for a group
+const deleteConversationForAll = async (req, res) => {
+  try {
+    const { userId, org_id } = req.user;
+    const { id } = req.params;
+
+    const conversation = await Conversation.findOne({
+      where: { id, org_id },
+      attributes: ["id", "type", "is_deleted"],
+    });
+    if (!conversation) {
+      return sendResponse(res, 404, false, "Conversation not found");
+    }
+    if (Number(conversation.type) !== 2) {
+      return sendResponse(res, 400, false, "Delete for all is only available for groups");
+    }
+    if (Number(conversation.is_deleted) === 1) {
+      return sendResponse(res, 400, false, "Conversation already deleted");
+    }
+
+    await conversation.update({
+      is_deleted: 1,
+      deleted_for_all_at: new Date(),
+      deleted_for_all_by: userId,
+    });
+
+    const participantRows = await ConversationParticipant.findAll({
+      where: { conversation_id: id, org_id, is_active: 1 },
+      attributes: ["user_id"],
+      raw: true,
+    });
+    const userIds = participantRows.map((r) => r.user_id);
+
+    await invalidateParticipants(id);
+    await leaveUsersFromConversationRoom(id, userIds);
+
+    try {
+      global._io?.to?.(`conv:${id}`)?.emit?.("conversation:deleted_all", {
+        conversation_id: id,
+        deleted_by: userId,
+      });
+    } catch (_err) {
+      // best effort
+    }
+
+    sendResponse(res, 200, true, "Conversation deleted for all");
+  } catch (error) {
+    console.error("deleteConversationForAll error:", error.message);
+    sendResponse(res, 500, false, "Failed to delete conversation for all");
+  }
+};
+
+// POST /conversations/:id/leave — leave group (member only)
+const leaveGroup = async (req, res) => {
+  try {
+    const { userId, org_id } = req.user;
+    const { id } = req.params;
+
+    const conversation = await Conversation.findOne({
+      where: { id, org_id, is_deleted: 0 },
+      attributes: ["id", "type"],
+      raw: true,
+    });
+    if (!conversation) {
+      return sendResponse(res, 404, false, "Conversation not found");
+    }
+    if (Number(conversation.type) !== 2) {
+      return sendResponse(res, 400, false, "Leave group is only available for groups");
+    }
+
+    const participant = await ConversationParticipant.findOne({
+      where: { conversation_id: id, user_id: userId, org_id, is_active: 1 },
+    });
+    if (!participant) {
+      return sendResponse(res, 404, false, "Not a participant");
+    }
+    if (Number(participant.role) !== 3) {
+      return sendResponse(res, 403, false, "Only members can leave the group");
+    }
+
+    await participant.update({
+      is_active: 0,
+      left_at: new Date(),
+      hidden_last_message_id: null,
+      hidden_at: null,
+    });
+    await invalidateParticipants(id);
+    await leaveUsersFromConversationRoom(id, [userId]);
+    await removeConversationUnread(userId, id);
+
+    await ConversationActivityLog.create({
+      conversation_id: id, org_id, actor_id: userId, action: "left",
+    });
+
+    const cachedActor = await getCachedUsers([userId]);
+    const actorName =
+      cachedActor[userId]?.name
+      || cachedActor[userId]?.full_name
+      || cachedActor[userId]?.first_name
+      || `User ${userId}`;
+
+    const sysMsg = await Message.create({
+      conversation_id: id,
+      org_id,
+      sender_id: userId,
+      kind: 3,
+      content: `${actorName} left the group`,
+      system_action: "member_left",
+    });
+
+    emitNewMessage(id, sysMsg.toJSON());
+    await fanoutSystemMessage({
+      message: sysMsg,
+      conversation_id: id,
+      org_id,
+      sender_id: userId,
+      system_action: "member_left",
+    });
+
+    emitConversationRemovedToUser({ userId, conversationId: id, reason: "left" });
+    sendResponse(res, 200, true, "Left group");
+  } catch (error) {
+    console.error("leaveGroup error:", error.message);
+    sendResponse(res, 500, false, "Failed to leave group");
+  }
+};
+
 // DELETE /conversations/:id — leave conversation
 const leaveConversation = async (req, res) => {
   try {
@@ -1071,7 +1275,10 @@ module.exports = {
   createConversation,
   getConversationById,
   updateConversation,
+  hideConversation,
+  deleteConversationForAll,
   leaveConversation,
+  leaveGroup,
   addMembers,
   removeMember,
   blockMember,

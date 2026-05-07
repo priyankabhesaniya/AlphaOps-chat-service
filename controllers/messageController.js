@@ -19,6 +19,15 @@ const getMessages = async (req, res) => {
     const queryLimit = Math.min(parseInt(limit, 10) || 50, 100);
     const fetchLimit = Math.max(queryLimit * 2, 50);
 
+    // Per-user hide watermark: if the user hid the conversation at message ID N,
+    // they should only see messages with id > N.
+    const participant = await ConversationParticipant.findOne({
+      where: { conversation_id: conversationId, user_id: userId, org_id, is_active: 1 },
+      attributes: ["hidden_last_message_id"],
+      raw: true,
+    });
+    const hiddenLastMessageId = participant?.hidden_last_message_id ?? null;
+
     const baseWhere = {
       conversation_id: conversationId,
       org_id,
@@ -30,7 +39,11 @@ const getMessages = async (req, res) => {
 
     while (visibleMessages.length < queryLimit) {
       const where = { ...baseWhere };
-      if (lastId) {
+      if (hiddenLastMessageId != null && hiddenLastMessageId !== "") {
+        where.id = lastId
+          ? { [Op.lt]: lastId, [Op.gt]: String(hiddenLastMessageId) }
+          : { [Op.gt]: String(hiddenLastMessageId) };
+      } else if (lastId) {
         where.id = { [Op.lt]: lastId };
       }
 
@@ -76,7 +89,7 @@ const getMessages = async (req, res) => {
     const nextCursor = resultMessages.length > 0 ? resultMessages[resultMessages.length - 1].id : null;
 
     const senderIds = [...new Set(resultMessages.map((m) => m.sender_id))];
-    const userMap = await getCachedUsers(senderIds);
+    const userMap = await getCachedUsers(senderIds, org_id);
 
     const filteredIds = resultMessages.map((m) => m.id);
     const reactions = filteredIds.length > 0

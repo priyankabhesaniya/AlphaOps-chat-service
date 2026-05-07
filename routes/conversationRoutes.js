@@ -17,8 +17,17 @@ router.get("/:id", authMiddleware, participantGuard, conversationController.getC
 // Update group info (admin/owner)
 router.put("/:id", authMiddleware, participantGuard, roleGuard([1, 2]), conversationController.updateConversation);
 
-// Leave conversation
+// Per-user delete (hide until new messages arrive)
+router.delete("/:id/hide", authMiddleware, participantGuard, conversationController.hideConversation);
+
+// Delete for all (admin/owner only) — groups only
+router.delete("/:id/all", authMiddleware, participantGuard, roleGuard([1, 2]), conversationController.deleteConversationForAll);
+
+// Leave conversation (legacy)
 router.delete("/:id", authMiddleware, participantGuard, conversationController.leaveConversation);
+
+// Leave group (member only)
+router.post("/:id/leave", authMiddleware, participantGuard, conversationController.leaveGroup);
 
 // Add members (admin/owner)
 router.post("/:id/members", authMiddleware, participantGuard, roleGuard([1, 2]), conversationController.addMembers);

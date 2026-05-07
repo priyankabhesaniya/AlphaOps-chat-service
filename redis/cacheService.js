@@ -96,7 +96,21 @@ async function getCachedUser(userId) {
   return val ? JSON.parse(val) : null;
 }
 
-async function getCachedUsers(userIds) {
+/**
+ * Get a single user with DB fallback.
+ * Uses the same semantics as getCachedUsers(), but returns one user object (or null).
+ */
+async function getHydratedUser(userId, orgId = null) {
+  if (!userId) return null;
+  try {
+    const map = await getCachedUsers([userId], orgId);
+    return map?.[userId] || map?.[String(userId)] || null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+async function getCachedUsers(userIds, orgId = null) {
   if (!userIds || !userIds.length) return {};
 
   // Try Redis first
@@ -115,7 +129,7 @@ async function getCachedUsers(userIds) {
     });
     // Fetch missing from DB and backfill cache
     if (missingIds.length > 0) {
-      const dbUsers = await getUsersFromDb(missingIds);
+      const dbUsers = await getUsersFromDb(missingIds, orgId);
       for (const [id, user] of Object.entries(dbUsers)) {
         map[id] = user;
         setCachedUser(id, user).catch(() => {});
@@ -125,7 +139,7 @@ async function getCachedUsers(userIds) {
   }
 
   // Redis down — fetch all from DB
-  return getUsersFromDb(userIds);
+  return getUsersFromDb(userIds, orgId);
 }
 
 // --- Idempotency ---
@@ -216,6 +230,7 @@ module.exports = {
   invalidateParticipants,
   setCachedUser,
   getCachedUser,
+  getHydratedUser,
   getCachedUsers,
   setIdempotencyKey,
   getIdempotencyKey,

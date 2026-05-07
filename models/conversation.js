@@ -69,6 +69,14 @@ const Conversation = sequelizeWrite.define('Conversation', {
     allowNull: false,
     defaultValue: 0,
   },
+  deleted_for_all_at: {
+    type: DataTypes.DATE(3),
+    allowNull: true,
+  },
+  deleted_for_all_by: {
+    type: DataTypes.INTEGER,
+    allowNull: true,
+  },
 }, {
   tableName: 'conversations',
   timestamps: true,

@@ -1,9 +1,10 @@
 const { Conversation, ConversationParticipant, Message, MessageMention, MessageSearchIndex } = require("../models");
-const { getParticipantIds, getCachedUser } = require("../redis/cacheService");
+const { getParticipantIds, getCachedUser, getHydratedUser } = require("../redis/cacheService");
 const { userSockets } = require("../socket/userSocketStore");
 const { isConnected, redis } = require("../redis/client");
 const axios = require("axios");
 const { toPlainText } = require("../utils/richText");
+const { Op } = require("sequelize");
 
 const NOTIFICATION_SERVICE_URL = process.env.NOTIFICATION_SERVICE_URL || "http://localhost:3008";
 
@@ -51,7 +52,7 @@ async function processMessageFanout(job) {
 
   let senderName = null;
   try {
-    const senderUser = await getCachedUser(sender_id);
+    const senderUser = await getHydratedUser(sender_id, org_id);
     if (senderUser) {
       senderName = senderUser.name || senderUser.full_name || senderUser.first_name || null;
     }
@@ -163,6 +164,114 @@ async function processMessageFanout(job) {
     },
     { where: { id: conversation_id } }
   );
+
+  // 4.1 Unhide conversations that were soft-deleted "for me"
+  // If a user hid the conversation, it should reappear automatically when a new message arrives.
+  // We also emit conversation:created so clients that removed it can re-add instantly.
+  if (recipients.length > 0) {
+    try {
+      const hiddenRows = await ConversationParticipant.findAll({
+        where: {
+          conversation_id,
+          user_id: recipients,
+          is_active: 1,
+          hidden_last_message_id: { [Op.not]: null, [Op.lt]: message_id },
+        },
+        attributes: ["user_id", "role", "is_favorite", "is_muted"],
+        raw: true,
+      });
+
+      if (hiddenRows.length > 0) {
+        const hiddenUserIds = hiddenRows.map((r) => r.user_id);
+        await ConversationParticipant.update(
+          { hidden_last_message_id: null, hidden_at: null },
+          { where: { conversation_id, user_id: hiddenUserIds } }
+        );
+
+        const conv = await Conversation.findOne({
+          where: { id: conversation_id, is_deleted: 0 },
+          attributes: [
+            "id",
+            "org_id",
+            "type",
+            "title",
+            "avatar_url",
+            "group_type",
+            "is_read_only",
+            "allow_read_receipts",
+            "last_message_id",
+            "last_message_at",
+            "last_message_preview",
+            "last_message_sender_id",
+            "created_by",
+            "created_at",
+          ],
+          raw: true,
+        });
+
+        if (conv) {
+          const senders = new Set([conv.last_message_sender_id, sender_id].filter(Boolean).map(String));
+          const lastSender = conv.last_message_sender_id
+            ? await getCachedUser(conv.last_message_sender_id).catch(() => null)
+            : null;
+
+          for (const row of hiddenRows) {
+            const uid = row.user_id;
+            const sockets = userSockets.get(String(uid));
+            if (!sockets || sockets.size === 0) continue;
+
+            let title = conv.title;
+            let avatarUrl = conv.avatar_url;
+            let otherUserId = null;
+            let otherUser = null;
+
+            if (Number(conv.type) === 1) {
+              otherUserId = participantIds.find((id) => String(id) !== String(uid)) || null;
+              if (otherUserId) {
+                otherUser = await getHydratedUser(otherUserId, org_id);
+                title = otherUser?.name || otherUser?.full_name || otherUser?.first_name || `User ${otherUserId}`;
+                avatarUrl = otherUser?.avatar_url || null;
+              } else {
+                title = "Chat";
+                avatarUrl = null;
+              }
+            }
+
+            const payload = {
+              id: conv.id,
+              type: conv.type,
+              title,
+              avatar_url: avatarUrl,
+              group_type: conv.group_type,
+              is_read_only: conv.is_read_only,
+              allow_read_receipts: conv.allow_read_receipts,
+              last_message_id: conv.last_message_id,
+              last_message_at: conv.last_message_at ? new Date(conv.last_message_at).toISOString() : null,
+              last_message_preview: conv.last_message_preview,
+              last_message_sender_id: conv.last_message_sender_id,
+              created_by: conv.created_by,
+              created_at: conv.created_at ? new Date(conv.created_at).toISOString() : null,
+              role: row.role,
+              is_favorite: row.is_favorite,
+              is_muted: row.is_muted,
+              last_read_message_id: null,
+              unread_count: uidUnreadMap[String(uid)] ?? null,
+              last_message_sender: lastSender || null,
+              other_user_id: otherUserId,
+              other_user: otherUser || null,
+              participant_count: participantIds.length,
+              members: participantIds,
+            };
+
+            // Adapter-safe: emit to per-user room (works across instances)
+            global._io?.to?.(`user:${uid}`)?.emit?.("conversation:created", payload);
+          }
+        }
+      }
+    } catch (err) {
+      console.error("[fanout] unhide failed:", err.message);
+    }
+  }
 
   // 5. Thread reply count increment
   if (parent_message_id) {

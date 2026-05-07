@@ -59,6 +59,14 @@ const ConversationParticipant = sequelizeWrite.define('ConversationParticipant',
     type: DataTypes.DATE,
     allowNull: true,
   },
+  hidden_last_message_id: {
+    type: DataTypes.BIGINT,
+    allowNull: true,
+  },
+  hidden_at: {
+    type: DataTypes.DATE(3),
+    allowNull: true,
+  },
   is_active: {
     type: DataTypes.TINYINT(1),
     allowNull: false,

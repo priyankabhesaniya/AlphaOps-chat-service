@@ -130,6 +130,8 @@ function initSocket(server) {
     // Set presence
     await setPresence(orgId, userId);
     socket.join(`org:${orgId}`);
+    // Per-user room for adapter-safe direct emits (works across instances)
+    socket.join(`user:${userId}`);
 
     // Join user to all their active conversation rooms
     let participations = [];
@@ -189,9 +191,28 @@ function initSocket(server) {
           ? data.conversation_ids.map((id) => String(id)).filter(Boolean)
           : [];
         const desiredRooms = new Set(requested.map((id) => `conv:${id}`));
+
+        // Safety: never leave rooms for conversations this user still participates in.
+        // UI visibility (or client bugs) must not break real-time delivery/read.
+        let activeConvIdSet = null;
+        try {
+          const rows = await ConversationParticipant.findAll({
+            where: { user_id: userId, org_id: orgId, is_active: 1 },
+            attributes: ["conversation_id"],
+            raw: true,
+          });
+          activeConvIdSet = new Set(rows.map((r) => String(r.conversation_id)));
+        } catch (_err) {
+          activeConvIdSet = null;
+        }
+
         const currentRooms = [...socket.rooms].filter((room) => room.startsWith("conv:"));
         currentRooms.forEach((room) => {
           if (!desiredRooms.has(room)) {
+            const convId = room.slice("conv:".length);
+            if (activeConvIdSet && activeConvIdSet.has(String(convId))) {
+              return;
+            }
             socket.leave(room);
           }
         });
