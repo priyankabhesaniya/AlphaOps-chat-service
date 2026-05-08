@@ -20,13 +20,8 @@ const searchMessages = async (req, res) => {
 
     if (conversation_id) {
       // Scoped search: within a specific conversation
-      const where = {
-        org_id,
-        conversation_id: parseInt(conversation_id),
-      };
-
       let cursorFilter = "";
-      const replacements = { orgId: org_id, convId: parseInt(conversation_id), query: searchQuery };
+      const replacements = { userId, orgId: org_id, convId: parseInt(conversation_id), query: searchQuery };
 
       if (cursor) {
         cursorFilter = "AND msi.id < :cursor";
@@ -36,8 +31,12 @@ const searchMessages = async (req, res) => {
       results = await sequelizeRead.query(
         `SELECT msi.id, msi.message_id, msi.conversation_id, msi.sender_id, msi.content, msi.created_at
          FROM message_search_index msi
+         JOIN conversation_participants cp ON cp.conversation_id = msi.conversation_id
+           AND cp.user_id = :userId AND cp.org_id = :orgId AND cp.is_active = 1
          WHERE msi.org_id = :orgId AND msi.conversation_id = :convId
            AND MATCH(msi.content) AGAINST(:query IN BOOLEAN MODE)
+           AND msi.created_at >= cp.joined_at
+           AND (cp.hidden_last_message_id IS NULL OR msi.message_id > cp.hidden_last_message_id)
            ${cursorFilter}
          ORDER BY msi.id DESC
          LIMIT :limit`,
@@ -60,9 +59,11 @@ const searchMessages = async (req, res) => {
         `SELECT msi.id, msi.message_id, msi.conversation_id, msi.sender_id, msi.content, msi.created_at
          FROM message_search_index msi
          JOIN conversation_participants cp ON cp.conversation_id = msi.conversation_id
-           AND cp.user_id = :userId AND cp.is_active = 1
+           AND cp.user_id = :userId AND cp.org_id = :orgId AND cp.is_active = 1
          WHERE msi.org_id = :orgId
            AND MATCH(msi.content) AGAINST(:query IN BOOLEAN MODE)
+           AND msi.created_at >= cp.joined_at
+           AND (cp.hidden_last_message_id IS NULL OR msi.message_id > cp.hidden_last_message_id)
            ${cursorFilter}
          ORDER BY msi.id DESC
          LIMIT :limit`,

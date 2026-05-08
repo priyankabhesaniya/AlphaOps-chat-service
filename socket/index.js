@@ -23,6 +23,21 @@ async function reconcilePendingDeliveries(io, userId, orgId, participations) {
 
   for (const convId of conversationIds) {
     try {
+      // Visibility window enforcement (no hidden history replay on reconnect)
+      const participant = await ConversationParticipant.findOne({
+        where: { conversation_id: convId, user_id: userId, org_id: orgId, is_active: 1 },
+        attributes: ["hidden_last_message_id", "joined_at"],
+        raw: true,
+      });
+      if (!participant) continue;
+
+      const hiddenLastMessageId =
+        participant.hidden_last_message_id != null && participant.hidden_last_message_id !== ""
+          ? Number(participant.hidden_last_message_id)
+          : null;
+      const joinedAt = participant.joined_at ? new Date(participant.joined_at) : null;
+      const joinedAtValid = joinedAt && !Number.isNaN(joinedAt.getTime()) ? joinedAt : null;
+
       // Find the highest message_id already delivered by this user in this conversation
       const lastDelivered = await MessageDelivery.findOne({
         where: { conversation_id: convId, user_id: userId },
@@ -31,6 +46,9 @@ async function reconcilePendingDeliveries(io, userId, orgId, participations) {
         raw: true,
       });
       const afterId = lastDelivered ? lastDelivered.message_id : 0;
+      const minVisibleIdExclusive = Number.isFinite(hiddenLastMessageId)
+        ? Math.max(Number(afterId || 0), Number(hiddenLastMessageId))
+        : Number(afterId || 0);
 
       // Find undelivered messages (sent by others, newer than what was delivered, limit 100)
       const undelivered = await Message.findAll({
@@ -38,7 +56,8 @@ async function reconcilePendingDeliveries(io, userId, orgId, participations) {
           conversation_id: convId,
           sender_id: { [Op.ne]: userId },
           is_deleted: 0,
-          id: { [Op.gt]: afterId },
+          id: { [Op.gt]: minVisibleIdExclusive },
+          ...(joinedAtValid ? { created_at: { [Op.gte]: joinedAtValid } } : {}),
         },
         order: [["id", "DESC"]],
         limit: 100,

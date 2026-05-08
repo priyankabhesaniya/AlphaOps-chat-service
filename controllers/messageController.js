@@ -10,6 +10,62 @@ const { sendResponse } = require("../utils/responseUtils");
 const { getCachedUsers, getMessageDeliveries } = require("../redis/cacheService");
 const { Op } = require("sequelize");
 
+async function getVisibilityWindow({ conversationId, userId, org_id }) {
+  const participant = await ConversationParticipant.findOne({
+    where: { conversation_id: conversationId, user_id: userId, org_id, is_active: 1 },
+    attributes: ["hidden_last_message_id", "joined_at"],
+    raw: true,
+  });
+
+  if (!participant) return null;
+
+  const hiddenLastMessageId =
+    participant.hidden_last_message_id != null && participant.hidden_last_message_id !== ""
+      ? Number(participant.hidden_last_message_id)
+      : null;
+
+  const joinedAt = participant.joined_at ? new Date(participant.joined_at) : null;
+
+  return {
+    hiddenLastMessageId: Number.isFinite(hiddenLastMessageId) ? hiddenLastMessageId : null,
+    joinedAt: joinedAt && !Number.isNaN(joinedAt.getTime()) ? joinedAt : null,
+  };
+}
+
+function applyVisibilityWhere({ where, window, lastId, cursorUpperId, lowerBoundExclusiveId }) {
+  const out = { ...where };
+
+  const and = [];
+
+  if (window?.joinedAt) {
+    and.push({ created_at: { [Op.gte]: window.joinedAt } });
+  }
+
+  // Cursor upper bound (pagination scanning)
+  if (Number.isFinite(Number(cursorUpperId))) {
+    and.push({ id: { [Op.lt]: Number(cursorUpperId) } });
+  }
+
+  // Standard cursor pagination
+  if (Number.isFinite(Number(lastId))) {
+    and.push({ id: { [Op.lt]: Number(lastId) } });
+  }
+
+  // since_id lower bound for delta sync
+  if (Number.isFinite(Number(lowerBoundExclusiveId))) {
+    and.push({ id: { [Op.gt]: Number(lowerBoundExclusiveId) } });
+  }
+
+  // Per-user hide watermark
+  if (Number.isFinite(Number(window?.hiddenLastMessageId))) {
+    and.push({ id: { [Op.gt]: Number(window.hiddenLastMessageId) } });
+  }
+
+  if (and.length > 0) out[Op.and] = (out[Op.and] || []).concat(and);
+
+  return out;
+}
+
 async function formatMessageRowsForClient(resultMessages, org_id) {
   const senderIds = [...new Set(resultMessages.map((m) => m.sender_id))];
   const userMap = await getCachedUsers(senderIds, org_id);
@@ -56,14 +112,8 @@ const getMessages = async (req, res) => {
     const queryLimit = Math.min(parseInt(limit, 10) || 50, 100);
     const fetchLimit = Math.max(queryLimit * 2, 50);
 
-    // Per-user hide watermark: if the user hid the conversation at message ID N,
-    // they should only see messages with id > N.
-    const participant = await ConversationParticipant.findOne({
-      where: { conversation_id: conversationId, user_id: userId, org_id, is_active: 1 },
-      attributes: ["hidden_last_message_id"],
-      raw: true,
-    });
-    const hiddenLastMessageId = participant?.hidden_last_message_id ?? null;
+    const window = await getVisibilityWindow({ conversationId, userId, org_id });
+    if (!window) return sendResponse(res, 404, false, "Not a participant");
 
     const baseWhere = {
       conversation_id: conversationId,
@@ -83,20 +133,20 @@ const getMessages = async (req, res) => {
       }
 
       let lowerBound = sinceNum;
-      if (hiddenLastMessageId != null && hiddenLastMessageId !== "") {
-        lowerBound = Math.max(sinceNum, Number(hiddenLastMessageId));
+      if (Number.isFinite(Number(window.hiddenLastMessageId))) {
+        lowerBound = Math.max(sinceNum, Number(window.hiddenLastMessageId));
       }
 
       let visibleMessages = [];
       let lastCursorUpper = null;
 
       while (visibleMessages.length < queryLimit) {
-        const where = { ...baseWhere };
-        if (lastCursorUpper == null) {
-          where.id = { [Op.gt]: lowerBound };
-        } else {
-          where.id = { [Op.and]: [{ [Op.gt]: lowerBound }, { [Op.lt]: lastCursorUpper }] };
-        }
+        const where = applyVisibilityWhere({
+          where: baseWhere,
+          window,
+          cursorUpperId: lastCursorUpper == null ? null : lastCursorUpper,
+          lowerBoundExclusiveId: lowerBound,
+        });
 
         const batch = await Message.findAll({
           where,
@@ -143,14 +193,11 @@ const getMessages = async (req, res) => {
     let hasMore = false;
 
     while (visibleMessages.length < queryLimit) {
-      const where = { ...baseWhere };
-      if (hiddenLastMessageId != null && hiddenLastMessageId !== "") {
-        where.id = lastId
-          ? { [Op.lt]: lastId, [Op.gt]: String(hiddenLastMessageId) }
-          : { [Op.gt]: String(hiddenLastMessageId) };
-      } else if (lastId) {
-        where.id = { [Op.lt]: lastId };
-      }
+      const where = applyVisibilityWhere({
+        where: baseWhere,
+        window,
+        lastId,
+      });
 
       const batch = await Message.findAll({
         where,
@@ -209,15 +256,17 @@ const getMessages = async (req, res) => {
 // GET /conversations/:id/messages/:msgId/thread — thread replies
 const getThread = async (req, res) => {
   try {
-    const { org_id } = req.user;
+    const { userId, org_id } = req.user;
     const { id: conversationId, msgId } = req.params;
 
+    const window = await getVisibilityWindow({ conversationId, userId, org_id });
+    if (!window) return sendResponse(res, 404, false, "Not a participant");
+
     const replies = await Message.findAll({
-      where: {
-        conversation_id: conversationId,
-        org_id,
-        parent_message_id: msgId,
-      },
+      where: applyVisibilityWhere({
+        where: { conversation_id: conversationId, org_id, parent_message_id: msgId },
+        window,
+      }),
       order: [["id", "ASC"]],
       limit: 100,
       raw: true,
@@ -225,9 +274,16 @@ const getThread = async (req, res) => {
 
     // Parent message
     const parent = await Message.findOne({
-      where: { id: msgId, conversation_id: conversationId, org_id },
+      where: applyVisibilityWhere({
+        where: { id: msgId, conversation_id: conversationId, org_id },
+        window,
+      }),
       raw: true,
     });
+
+    if (!parent) {
+      return sendResponse(res, 404, false, "Message not found");
+    }
 
     // Batch user lookup
     const allSenderIds = [...new Set([parent?.sender_id, ...replies.map((r) => r.sender_id)].filter(Boolean))];
@@ -265,8 +321,23 @@ const getThread = async (req, res) => {
 // GET /conversations/:id/messages/:msgId/info — who read + delivered + not_received + reactions + edit history
 const getMessageInfo = async (req, res) => {
   try {
-    const { org_id } = req.user;
+    const { userId, org_id } = req.user;
     const { id: conversationId, msgId } = req.params;
+
+    const window = await getVisibilityWindow({ conversationId, userId, org_id });
+    if (!window) return sendResponse(res, 404, false, "Not a participant");
+
+    const visibleTarget = await Message.findOne({
+      where: applyVisibilityWhere({
+        where: { id: msgId, conversation_id: conversationId, org_id },
+        window,
+      }),
+      attributes: ["id", "sender_id"],
+      raw: true,
+    });
+    if (!visibleTarget) {
+      return sendResponse(res, 404, false, "Message not found");
+    }
 
     // Who read (watermark-based)
     const readBy = await ConversationParticipant.findAll({
@@ -299,7 +370,6 @@ const getMessageInfo = async (req, res) => {
     }));
 
     // NOT RECEIVED: participants who haven't read or received the message yet (excluding sender)
-    const targetMsg = await Message.findByPk(msgId, { attributes: ["sender_id"], raw: true });
     const allParticipants = await ConversationParticipant.findAll({
       where: { conversation_id: conversationId, is_active: 1 },
       attributes: ["user_id"],
@@ -308,7 +378,7 @@ const getMessageInfo = async (req, res) => {
 
     const readSet = new Set(readUserIds.map(String));
     const deliveredSet = new Set(deliveredUserIds.map(String));
-    const senderStr = targetMsg ? String(targetMsg.sender_id) : null;
+    const senderStr = visibleTarget ? String(visibleTarget.sender_id) : null;
 
     const notReceivedIds = allParticipants
       .map((p) => p.user_id)
@@ -359,11 +429,17 @@ const getMessageInfo = async (req, res) => {
 // GET /conversations/:id/pinned — pinned messages
 const getPinnedMessages = async (req, res) => {
   try {
-    const { org_id } = req.user;
+    const { userId, org_id } = req.user;
     const { id: conversationId } = req.params;
 
+    const window = await getVisibilityWindow({ conversationId, userId, org_id });
+    if (!window) return sendResponse(res, 404, false, "Not a participant");
+
     const pinned = await Message.findAll({
-      where: { conversation_id: conversationId, org_id, is_pinned: 1, is_deleted: 0 },
+      where: applyVisibilityWhere({
+        where: { conversation_id: conversationId, org_id, is_pinned: 1, is_deleted: 0 },
+        window,
+      }),
       order: [["id", "DESC"]],
       raw: true,
     });
@@ -386,14 +462,26 @@ const getPinnedMessages = async (req, res) => {
 // PUT /messages/:id/pin — toggle pin
 const togglePin = async (req, res) => {
   try {
-    const { org_id } = req.user;
+    const { userId, org_id } = req.user;
     const { id: messageId } = req.params;
 
     const message = await Message.findOne({
       where: { id: messageId, org_id, is_deleted: 0 },
+      attributes: ["id", "conversation_id", "created_at"],
     });
     if (!message) {
       return sendResponse(res, 404, false, "Message not found");
+    }
+
+    const window = await getVisibilityWindow({ conversationId: message.conversation_id, userId, org_id });
+    if (!window) return sendResponse(res, 404, false, "Not a participant");
+
+    // Enforce visibility window: a user cannot pin hidden history.
+    if (window.joinedAt && new Date(message.created_at) < window.joinedAt) {
+      return sendResponse(res, 403, false, "Message not accessible");
+    }
+    if (Number.isFinite(Number(window.hiddenLastMessageId)) && Number(message.id) <= Number(window.hiddenLastMessageId)) {
+      return sendResponse(res, 403, false, "Message not accessible");
     }
 
     await message.update({ is_pinned: message.is_pinned ? 0 : 1 });
@@ -407,18 +495,24 @@ const togglePin = async (req, res) => {
 // GET /conversations/:id/files — file messages
 const getFiles = async (req, res) => {
   try {
-    const { org_id } = req.user;
+    const { userId, org_id } = req.user;
     const { id: conversationId } = req.params;
     const { cursor, limit = 30 } = req.query;
     const queryLimit = Math.min(parseInt(limit), 100);
 
-    const where = {
+    const window = await getVisibilityWindow({ conversationId, userId, org_id });
+    if (!window) return sendResponse(res, 404, false, "Not a participant");
+
+    const where = applyVisibilityWhere({
+      where: {
       conversation_id: conversationId,
       org_id,
       kind: 2, // file
       is_deleted: 0,
-    };
-    if (cursor) where.id = { [Op.lt]: parseInt(cursor) };
+      },
+      window,
+      lastId: cursor ? parseInt(cursor, 10) : undefined,
+    });
 
     const files = await Message.findAll({
       where,
@@ -453,6 +547,9 @@ const getStarredMessages = async (req, res) => {
     const { cursor, limit = 30 } = req.query;
     const queryLimit = Math.min(parseInt(limit), 100);
 
+    const window = await getVisibilityWindow({ conversationId, userId, org_id });
+    if (!window) return sendResponse(res, 404, false, "Not a participant");
+
     const where = {
       user_id: userId,
       conversation_id: conversationId,
@@ -473,7 +570,10 @@ const getStarredMessages = async (req, res) => {
 
     // Fetch actual messages
     const messages = await Message.findAll({
-      where: { id: { [Op.in]: messageIds }, is_deleted: 0 },
+      where: applyVisibilityWhere({
+        where: { id: { [Op.in]: messageIds }, conversation_id: conversationId, org_id, is_deleted: 0 },
+        window,
+      }),
       raw: true,
     });
     const msgMap = {};
@@ -512,11 +612,21 @@ const toggleStar = async (req, res) => {
 
     const message = await Message.findOne({
       where: { id: messageId, org_id, is_deleted: 0 },
-      attributes: ["id", "conversation_id"],
+      attributes: ["id", "conversation_id", "created_at"],
       raw: true,
     });
     if (!message) {
       return sendResponse(res, 404, false, "Message not found");
+    }
+
+    const window = await getVisibilityWindow({ conversationId: message.conversation_id, userId, org_id });
+    if (!window) return sendResponse(res, 404, false, "Not a participant");
+
+    if (window.joinedAt && new Date(message.created_at) < window.joinedAt) {
+      return sendResponse(res, 403, false, "Message not accessible");
+    }
+    if (Number.isFinite(Number(window.hiddenLastMessageId)) && Number(message.id) <= Number(window.hiddenLastMessageId)) {
+      return sendResponse(res, 403, false, "Message not accessible");
     }
 
     const existing = await StarredMessage.findOne({

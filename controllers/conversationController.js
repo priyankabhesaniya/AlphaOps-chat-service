@@ -251,6 +251,7 @@ const getConversations = async (req, res) => {
         "is_muted",
         "last_read_message_id",
         "unread_count",
+        "joined_at",
         "hidden_last_message_id",
         "hidden_at",
       ],
@@ -336,6 +337,32 @@ const getConversations = async (req, res) => {
         avatarUrl = otherUser?.avatar_url || null;
       }
 
+      // Prevent leaking pre-join or pre-hide history via preview fields.
+      // If the latest global last_message is not visible within this participant's window,
+      // return nulls for last message metadata for this user.
+      const joinedAt = p.joined_at ? new Date(p.joined_at) : null;
+      const hiddenLastMessageId =
+        p.hidden_last_message_id != null && p.hidden_last_message_id !== ""
+          ? Number(p.hidden_last_message_id)
+          : null;
+
+      const lastMessageAt = conv.last_message_at ? new Date(conv.last_message_at) : null;
+      const shouldHideByJoin =
+        joinedAt && lastMessageAt && !Number.isNaN(joinedAt.getTime()) && !Number.isNaN(lastMessageAt.getTime())
+          ? lastMessageAt < joinedAt
+          : false;
+      const shouldHideByLocalDelete =
+        Number.isFinite(hiddenLastMessageId) && conv.last_message_id != null
+          ? Number(conv.last_message_id) <= Number(hiddenLastMessageId)
+          : false;
+
+      if (shouldHideByJoin || shouldHideByLocalDelete) {
+        conv.last_message_id = null;
+        conv.last_message_at = null;
+        conv.last_message_preview = null;
+        conv.last_message_sender_id = null;
+      }
+
       return {
         ...conv,
         title,
@@ -347,7 +374,9 @@ const getConversations = async (req, res) => {
         unread_count: redisAvailable
           ? (unreads[String(conv.id)] || 0)
           : (p.unread_count || 0),
-        last_message_sender: withPresence(userMap[conv.last_message_sender_id]) || null,
+        last_message_sender: conv.last_message_sender_id
+          ? (withPresence(userMap[conv.last_message_sender_id]) || null)
+          : null,
         other_user_id: conv.type === 1 ? otherUserId : null,
         other_user: conv.type === 1 ? otherUser : null,
         participant_count: participantCount,

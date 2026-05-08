@@ -188,7 +188,10 @@ function setupMessageHandler(io, socket) {
 
           const hiddenUserIds = hiddenRows.map((r) => r.user_id);
           await ConversationParticipant.update(
-            { hidden_last_message_id: null, hidden_at: null },
+            // IMPORTANT: Do NOT reset hidden_last_message_id.
+            // It is the permanent per-user history cutoff (messages <= this remain hidden forever).
+            // We only clear hidden_at so the conversation becomes visible again.
+            { hidden_at: null },
             { where: { conversation_id, org_id: orgId, user_id: hiddenUserIds } }
           );
 
