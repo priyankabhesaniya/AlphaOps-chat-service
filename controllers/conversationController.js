@@ -6,7 +6,7 @@ const {
 } = require("../models");
 const { sendResponse } = require("../utils/responseUtils");
 const { invalidateParticipants, setParticipantIds, getCachedUsers, getOnlineUsers } = require("../redis/cacheService");
-const { getAllUnreads, removeConversationUnread } = require("../redis/unreadService");
+const { getUnreadHashRaw, removeConversationUnread } = require("../redis/unreadService");
 const { isConnected: isRedisConnected } = require("../redis/client");
 const { Op } = require("sequelize");
 const { sequelizeWrite } = require("../config/database");
@@ -224,10 +224,9 @@ const getConversations = async (req, res) => {
         org_id,
         is_active: 1,
         [Op.and]: [
-          // Hide conversations that the user soft-deleted, until a new message arrives.
-          sequelizeWrite.literal(
-            "(`ConversationParticipant`.`hidden_last_message_id` IS NULL OR `conversation`.`last_message_id` > `ConversationParticipant`.`hidden_last_message_id`)"
-          ),
+          // Sidebar: hide only while hidden_at is set (per-user soft delete / reopen).
+          // Message history cutoff stays on hidden_last_message_id in getMessages, not here.
+          sequelizeWrite.literal("`ConversationParticipant`.`hidden_at` IS NULL"),
         ],
       },
       include: [
@@ -255,18 +254,20 @@ const getConversations = async (req, res) => {
         "hidden_last_message_id",
         "hidden_at",
       ],
+      // Empty / draft threads have null last_message_at — use created_at so new DMs
+      // sort by recency and stay on page 1 instead of sinking below every chat with messages.
       order: [
         ["is_favorite", "DESC"],
-        [sequelizeWrite.literal("CASE WHEN `conversation`.`last_message_at` IS NULL THEN 1 ELSE 0 END"), "ASC"],
-        [{ model: Conversation, as: "conversation" }, "last_message_at", "DESC"],
+        [sequelizeWrite.literal("COALESCE(`conversation`.`last_message_at`, `conversation`.`created_at`)"), "DESC"],
       ],
       limit: parseInt(limit),
       offset,
     });
 
-    // Fetch unread counts from Redis. If Redis is unavailable, use DB snapshot.
+    // Fetch unread counts from Redis. When a conversation has no Redis field yet,
+    // fall back to DB unread_count (Redis restart / first load / keys evicted).
     const redisAvailable = isRedisConnected();
-    const unreads = redisAvailable ? await getAllUnreads(userId) : {};
+    const unreadHash = redisAvailable ? await getUnreadHashRaw(userId) : null;
 
     // Get conversation IDs for participant counts + DM other-user resolution
     const convIds = participants.map((p) => p.conversation_id);
@@ -295,7 +296,6 @@ const getConversations = async (req, res) => {
         where: {
           conversation_id: { [Op.in]: dmConvIds },
           user_id: { [Op.ne]: userId },
-          is_active: 1,
         },
         attributes: ["conversation_id", "user_id"],
         raw: true,
@@ -371,9 +371,15 @@ const getConversations = async (req, res) => {
         is_favorite: p.is_favorite,
         is_muted: p.is_muted,
         last_read_message_id: p.last_read_message_id,
-        unread_count: redisAvailable
-          ? (unreads[String(conv.id)] || 0)
-          : (p.unread_count || 0),
+        unread_count: (() => {
+          if (!redisAvailable) return p.unread_count || 0;
+          const key = String(conv.id);
+          if (unreadHash && Object.prototype.hasOwnProperty.call(unreadHash, key)) {
+            const n = parseInt(unreadHash[key], 10);
+            return Number.isFinite(n) ? Math.max(0, n) : (p.unread_count || 0);
+          }
+          return p.unread_count || 0;
+        })(),
         last_message_sender: conv.last_message_sender_id
           ? (withPresence(userMap[conv.last_message_sender_id]) || null)
           : null,
@@ -445,9 +451,23 @@ const createConversation = async (req, res) => {
       );
 
       if (existingDm.length > 0) {
+        const existingConversationId = existingDm[0].conversation_id;
+        // Reopen after "delete for me": show in sidebar again without restoring pre-hide messages
+        // (hidden_last_message_id remains the per-user message cutoff in getMessages).
+        await ConversationParticipant.update(
+          { hidden_at: null },
+          {
+            where: {
+              conversation_id: existingConversationId,
+              user_id: userId,
+              org_id,
+            },
+            transaction: t,
+          }
+        );
         await t.commit();
         return sendResponse(res, 200, true, "Existing DM found", {
-          conversation_id: existingDm[0].conversation_id,
+          conversation_id: existingConversationId,
           is_existing: true,
         });
       }
@@ -545,6 +565,20 @@ const createConversation = async (req, res) => {
 
     await ConversationParticipant.bulkCreate(participantRows, { transaction: t });
 
+    if (type === 1) {
+      const rawOther = participant_ids[0];
+      const parsedOther = parseInt(rawOther, 10);
+      if (Number.isFinite(parsedOther) && String(parsedOther) !== String(userId)) {
+        await ConversationParticipant.update(
+          { is_active: 0 },
+          {
+            where: { conversation_id: conversation.id, user_id: parsedOther, org_id },
+            transaction: t,
+          }
+        );
+      }
+    }
+
     // System message for group creation
     let createdSysMsg = null;
     let memberAddedSysMsgs = [];
@@ -597,8 +631,9 @@ const createConversation = async (req, res) => {
     await t.commit();
 
     // Cache participant IDs and ensure live sockets join the new conversation room.
-    await setParticipantIds(conversation.id, allParticipantIds);
-    await joinUsersToConversationRoom(conversation.id, allParticipantIds);
+    const socketJoinUserIds = type === 1 ? [userId] : allParticipantIds;
+    await setParticipantIds(conversation.id, socketJoinUserIds);
+    await joinUsersToConversationRoom(conversation.id, socketJoinUserIds);
 
     if (type === 2) {
       await broadcastSystemMessages(conversation.id, org_id, userId, [createdSysMsg, ...memberAddedSysMsgs]);
@@ -656,6 +691,9 @@ const createConversation = async (req, res) => {
 
     try {
       global._io?.to(`conv:${conversation.id}`)?.emit?.("conversation:created", eventPayload);
+      // Per-user room: creator may not have joined conv:{id} on the client yet; keeps listing in sync.
+      // (Groups: only creator here — avoid fanout to entire org for public groups.)
+      global._io?.to(`user:${userId}`)?.emit?.("conversation:created", eventPayload);
     } catch (err) {
       console.error("conversation:created emit failed:", err.message);
     }
@@ -663,6 +701,8 @@ const createConversation = async (req, res) => {
     sendResponse(res, 201, true, "Conversation created", {
       conversation_id: conversation.id,
       type,
+      // Same shape as socket conversation:created — lets the client merge before refetch races.
+      conversation: eventPayload,
     });
   } catch (error) {
     await t.rollback();

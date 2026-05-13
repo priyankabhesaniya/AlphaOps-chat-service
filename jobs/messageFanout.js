@@ -1,6 +1,5 @@
 const { Conversation, ConversationParticipant, Message, MessageMention, MessageSearchIndex } = require("../models");
 const { getParticipantIds, getCachedUser, getHydratedUser } = require("../redis/cacheService");
-const { userSockets } = require("../socket/userSocketStore");
 const { isConnected, redis } = require("../redis/client");
 const axios = require("axios");
 const { toPlainText } = require("../utils/richText");
@@ -132,18 +131,12 @@ async function processMessageFanout(job) {
     }
 
     for (const uid of recipients) {
-      const sockets = userSockets.get(String(uid));
-      if (!sockets || sockets.size === 0) continue;
       const newCount = uidUnreadMap[String(uid)];
       // Always emit absolute unread_count when available to avoid duplicate client increments.
       if (!Number.isFinite(newCount)) continue;
       const payload = { conversation_id, unread_count: newCount };
-      for (const socketId of sockets) {
-        const socketInstance = global._io?.sockets?.sockets?.get(socketId);
-        if (socketInstance) {
-          socketInstance.emit("unread:update", payload);
-        }
-      }
+      // Adapter-safe: same pattern as conversation:created — local sockets map misses remote nodes.
+      global._io?.to?.(`user:${uid}`)?.emit?.("unread:update", payload);
     }
   }
 
@@ -220,8 +213,6 @@ async function processMessageFanout(job) {
 
           for (const row of hiddenRows) {
             const uid = row.user_id;
-            const sockets = userSockets.get(String(uid));
-            if (!sockets || sockets.size === 0) continue;
 
             let title = conv.title;
             let avatarUrl = conv.avatar_url;
@@ -352,23 +343,15 @@ async function processMessageFanout(job) {
     }
   }
 
-  // 9. Emit conversation:updated to all participant sockets
+  // 9. Emit conversation:updated to all participants (adapter-safe)
   for (const uid of participantIds) {
-    const sockets = userSockets.get(String(uid));
-    if (sockets && sockets.size > 0) {
-      for (const socketId of sockets) {
-        const socketInstance = global._io?.sockets?.sockets?.get(socketId);
-        if (socketInstance) {
-          socketInstance.emit("conversation:updated", {
-            conversation_id,
-            last_message_id: message_id,
-            last_message_at: new Date().toISOString(),
-            last_message_preview: preview,
-            last_message_sender_id: sender_id,
-          });
-        }
-      }
-    }
+    global._io?.to?.(`user:${uid}`)?.emit?.("conversation:updated", {
+      conversation_id,
+      last_message_id: message_id,
+      last_message_at: new Date().toISOString(),
+      last_message_preview: preview,
+      last_message_sender_id: sender_id,
+    });
   }
 }
 

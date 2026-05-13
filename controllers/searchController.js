@@ -1,4 +1,3 @@
-const { MessageSearchIndex, ConversationParticipant } = require("../models");
 const { sendResponse } = require("../utils/responseUtils");
 const { getCachedUsers } = require("../redis/cacheService");
 const { sequelizeRead } = require("../config/database");
@@ -15,13 +14,15 @@ const searchMessages = async (req, res) => {
 
     const queryLimit = Math.min(parseInt(limit), 50);
     const searchQuery = q.trim();
+    // For BOOLEAN MODE, wrap with wildcards: +word*
+    const booleanQuery = searchQuery.split(/\s+/).map(word => `+${word}*`).join(' ');
 
     let results;
 
     if (conversation_id) {
       // Scoped search: within a specific conversation
       let cursorFilter = "";
-      const replacements = { userId, orgId: org_id, convId: parseInt(conversation_id), query: searchQuery };
+      const replacements = { userId, orgId: org_id, convId: parseInt(conversation_id), query: booleanQuery, likeQuery: `%${searchQuery}%` };
 
       if (cursor) {
         cursorFilter = "AND msi.id < :cursor";
@@ -31,12 +32,18 @@ const searchMessages = async (req, res) => {
       results = await sequelizeRead.query(
         `SELECT msi.id, msi.message_id, msi.conversation_id, msi.sender_id, msi.content, msi.created_at
          FROM message_search_index msi
+         INNER JOIN messages msg ON msg.id = msi.message_id
+           AND msg.org_id = msi.org_id AND msg.conversation_id = msi.conversation_id AND msg.is_deleted = 0
          JOIN conversation_participants cp ON cp.conversation_id = msi.conversation_id
            AND cp.user_id = :userId AND cp.org_id = :orgId AND cp.is_active = 1
          WHERE msi.org_id = :orgId AND msi.conversation_id = :convId
-           AND MATCH(msi.content) AGAINST(:query IN BOOLEAN MODE)
+           AND (MATCH(msi.content) AGAINST(:query IN BOOLEAN MODE) OR msi.content LIKE :likeQuery)
            AND msi.created_at >= cp.joined_at
            AND (cp.hidden_last_message_id IS NULL OR msi.message_id > cp.hidden_last_message_id)
+           AND NOT EXISTS (
+             SELECT 1 FROM message_deletions md
+             WHERE md.message_id = msi.message_id AND md.user_id = :userId
+           )
            ${cursorFilter}
          ORDER BY msi.id DESC
          LIMIT :limit`,
@@ -47,7 +54,7 @@ const searchMessages = async (req, res) => {
       );
     } else {
       // Global search: across all user's conversations
-      const replacements = { userId, orgId: org_id, query: searchQuery, limit: queryLimit + 1 };
+      const replacements = { userId, orgId: org_id, query: booleanQuery, likeQuery: `%${searchQuery}%`, limit: queryLimit + 1 };
 
       let cursorFilter = "";
       if (cursor) {
@@ -58,12 +65,18 @@ const searchMessages = async (req, res) => {
       results = await sequelizeRead.query(
         `SELECT msi.id, msi.message_id, msi.conversation_id, msi.sender_id, msi.content, msi.created_at
          FROM message_search_index msi
+         INNER JOIN messages msg ON msg.id = msi.message_id
+           AND msg.org_id = msi.org_id AND msg.conversation_id = msi.conversation_id AND msg.is_deleted = 0
          JOIN conversation_participants cp ON cp.conversation_id = msi.conversation_id
            AND cp.user_id = :userId AND cp.org_id = :orgId AND cp.is_active = 1
          WHERE msi.org_id = :orgId
-           AND MATCH(msi.content) AGAINST(:query IN BOOLEAN MODE)
+           AND (MATCH(msi.content) AGAINST(:query IN BOOLEAN MODE) OR msi.content LIKE :likeQuery)
            AND msi.created_at >= cp.joined_at
            AND (cp.hidden_last_message_id IS NULL OR msi.message_id > cp.hidden_last_message_id)
+           AND NOT EXISTS (
+             SELECT 1 FROM message_deletions md
+             WHERE md.message_id = msi.message_id AND md.user_id = :userId
+           )
            ${cursorFilter}
          ORDER BY msi.id DESC
          LIMIT :limit`,

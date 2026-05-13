@@ -1,5 +1,16 @@
 const { Message, Conversation, ConversationParticipant, MessageReaction, MessageEdit, MessageDeletion } = require("../models");
-const { getIdempotencyKey, setIdempotencyKey, getConversationParticipantIds, checkRateLimit, addMessageDelivery, getMessageDeliveries, getHydratedUser } = require("../redis/cacheService");
+const {
+  getIdempotencyKey,
+  setIdempotencyKey,
+  getConversationParticipantIds,
+  checkRateLimit,
+  addMessageDelivery,
+  getMessageDeliveries,
+  getHydratedUser,
+  invalidateParticipants,
+  setParticipantIds,
+  getOnlineUsers,
+} = require("../redis/cacheService");
 const { addMessageFanoutJob } = require("../jobs/queue");
 const processMessageFanout = require("../jobs/messageFanout");
 const { sanitizeRichText, toPlainText } = require("../utils/richText");
@@ -7,6 +18,104 @@ const { getUserSockets } = require("./userSocketStore");
 const { Op } = require("sequelize");
 
 const MESSAGE_KIND = { TEXT: 1, FILE: 2, SYSTEM: 3 };
+
+async function joinUsersToConversationRoomFromSocket(io, conversationId, userIds) {
+  if (!io || !Array.isArray(userIds) || userIds.length === 0) return;
+  const adapter = io.of("/").adapter;
+
+  for (const uid of userIds) {
+    const sockets = getUserSockets(uid);
+    for (const socketId of sockets) {
+      const socket = io.sockets.sockets.get(socketId);
+      if (socket) {
+        socket.join(`conv:${conversationId}`);
+      } else if (typeof adapter.remoteJoin === "function") {
+        try {
+          await adapter.remoteJoin(socketId, `conv:${conversationId}`);
+        } catch (_err) {
+          // best effort
+        }
+      }
+    }
+  }
+}
+
+async function activatePendingDmRecipientIfNeeded(io, { conversation_id, orgId, senderId, convType }) {
+  if (Number(convType) !== 1) return;
+
+  const pending = await ConversationParticipant.findOne({
+    where: {
+      conversation_id,
+      org_id: orgId,
+      is_active: 0,
+      left_at: null,
+    },
+    attributes: ["user_id"],
+    raw: true,
+  });
+
+  if (!pending?.user_id) return;
+  if (String(pending.user_id) === String(senderId)) return;
+
+  await ConversationParticipant.update(
+    { is_active: 1, joined_at: new Date() },
+    { where: { conversation_id, org_id: orgId, user_id: pending.user_id } }
+  );
+  await invalidateParticipants(conversation_id);
+  const ids = await getConversationParticipantIds(conversation_id, orgId);
+  await setParticipantIds(conversation_id, ids);
+  await joinUsersToConversationRoomFromSocket(io, conversation_id, [pending.user_id]);
+
+  const convRow = await Conversation.findOne({
+    where: { id: conversation_id, org_id: orgId, is_deleted: 0 },
+    attributes: [
+      "id", "type", "title", "avatar_url", "group_type", "is_read_only", "allow_read_receipts",
+      "last_message_id", "last_message_at", "last_message_preview", "last_message_sender_id",
+      "created_by", "created_at",
+    ],
+    raw: true,
+  });
+  if (!convRow) return;
+
+  const otherId = pending.user_id;
+  const otherUser = await getHydratedUser(otherId, orgId).catch(() => null);
+  const onlineIds = await getOnlineUsers(orgId, [otherId]).catch(() => []);
+  const onlineSet = new Set(onlineIds.map(String));
+  const hydratedOther = otherUser
+    ? { ...otherUser, is_online: onlineSet.has(String(otherId)) }
+    : null;
+  const lastSender = convRow.last_message_sender_id
+    ? await getHydratedUser(convRow.last_message_sender_id, orgId).catch(() => null)
+    : null;
+
+  const payload = {
+    id: convRow.id,
+    type: convRow.type,
+    title: hydratedOther?.name || hydratedOther?.full_name || hydratedOther?.first_name || `User ${otherId}`,
+    avatar_url: hydratedOther?.avatar_url || null,
+    group_type: convRow.group_type,
+    is_read_only: convRow.is_read_only,
+    allow_read_receipts: convRow.allow_read_receipts,
+    last_message_id: convRow.last_message_id,
+    last_message_at: convRow.last_message_at ? new Date(convRow.last_message_at).toISOString() : null,
+    last_message_preview: convRow.last_message_preview,
+    last_message_sender_id: convRow.last_message_sender_id,
+    created_by: convRow.created_by,
+    created_at: convRow.created_at ? new Date(convRow.created_at).toISOString() : null,
+    role: 3,
+    is_favorite: 0,
+    is_muted: 0,
+    last_read_message_id: null,
+    unread_count: 0,
+    other_user_id: otherId,
+    other_user: hydratedOther,
+    participant_count: ids.length,
+    members: ids,
+    last_message_sender: lastSender || null,
+  };
+
+  await emitConversationCreatedToUser(io, pending.user_id, payload);
+}
 
 async function collectDeliveredRecipients(io, conversationId, senderId) {
   const room = `conv:${conversationId}`;
@@ -86,6 +195,13 @@ function setupMessageHandler(io, socket) {
       if (!conv) {
         return ack?.({ error: "Conversation not found" });
       }
+
+      await activatePendingDmRecipientIfNeeded(io, {
+        conversation_id,
+        orgId,
+        senderId: userId,
+        convType: conv.type,
+      });
 
       // Participant enforcement (left/kicked users can't send)
       const membership = await ConversationParticipant.findOne({

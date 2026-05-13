@@ -39,6 +39,17 @@ async function getAllUnreads(userId) {
   return result;
 }
 
+/**
+ * Full Redis hash for a user's unread counters (string field values as stored in Redis).
+ * Used when merging with DB counts: a missing hash field means "no Redis overlay yet",
+ * not necessarily zero unread.
+ */
+async function getUnreadHashRaw(userId) {
+  if (!isConnected()) return null;
+  const data = await redis.hgetall(`unread:${userId}`);
+  return data && typeof data === "object" ? data : {};
+}
+
 async function getUnread(userId, conversationId) {
   if (!isConnected()) return 0;
   const val = await redis.hget(`unread:${userId}`, String(conversationId));
@@ -78,6 +89,7 @@ module.exports = {
   incrementUnreadBulk,
   resetUnread,
   getAllUnreads,
+  getUnreadHashRaw,
   getUnread,
   removeConversationUnread,
   hydrateFromDb,

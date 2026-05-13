@@ -1,6 +1,5 @@
 const { ConversationParticipant, Conversation, Message } = require("../models");
 const { resetUnread } = require("../redis/unreadService");
-const { getUserSockets } = require("./userSocketStore");
 const { Op } = require("sequelize");
 
 function setupReadHandler(io, socket) {
@@ -97,17 +96,11 @@ function setupReadHandler(io, socket) {
         });
       }
 
-      // Notify all connected sockets for this user that this conversation is now cleared.
-      const sockets = getUserSockets(userId);
-      for (const socketId of sockets || []) {
-        const socketInstance = global._io?.sockets?.sockets?.get(socketId);
-        if (socketInstance) {
-          socketInstance.emit("unread:update", {
-            conversation_id,
-            unread_count: 0,
-          });
-        }
-      }
+      // Notify all connected tabs / nodes for this user (Redis adapter–safe).
+      io.to(`user:${userId}`).emit("unread:update", {
+        conversation_id,
+        unread_count: 0,
+      });
     } catch (error) {
       console.error("message:read error:", error.message);
       ack?.({ error: "Failed to mark as read" });

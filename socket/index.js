@@ -177,7 +177,7 @@ function initSocket(server) {
       const convIds = participations.map((p) => p.conversation_id);
       if (convIds.length > 0) {
         const peerRows = await ConversationParticipant.findAll({
-          where: { conversation_id: convIds, org_id: orgId, is_active: 1 },
+          where: { conversation_id: convIds, org_id: orgId },
           attributes: ["user_id"],
           raw: true,
         });
@@ -249,7 +249,7 @@ function initSocket(server) {
         // Send a fresh presence snapshot for the users visible through the newly synced rooms.
         if (requested.length > 0) {
           const peerRows = await ConversationParticipant.findAll({
-            where: { conversation_id: requested, org_id: orgId, is_active: 1 },
+            where: { conversation_id: requested, org_id: orgId },
             attributes: ["user_id"],
             raw: true,
           });
