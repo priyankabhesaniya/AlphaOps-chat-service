@@ -14,6 +14,7 @@ const {
 const { addMessageFanoutJob } = require("../jobs/queue");
 const processMessageFanout = require("../jobs/messageFanout");
 const { sanitizeRichText, toPlainText } = require("../utils/richText");
+const { validateChatAttachmentPayload } = require("../utils/chatAttachmentRules");
 const { getUserSockets } = require("./userSocketStore");
 const { Op } = require("sequelize");
 
@@ -227,6 +228,17 @@ function setupMessageHandler(io, socket) {
         return ack?.({ error: "Message content is required" });
       }
 
+      if (Number(kind) === MESSAGE_KIND.FILE) {
+        const fileCheck = validateChatAttachmentPayload({
+          file_reference_id,
+          file_name,
+          file_size_bytes,
+        });
+        if (!fileCheck.ok) {
+          return ack?.({ error: fileCheck.error });
+        }
+      }
+
       // Rate limit: 60 msg/min per user
       const allowed = await checkRateLimit(`ratelimit:${userId}:msg`, 60, 60);
       if (!allowed) {
@@ -263,7 +275,7 @@ function setupMessageHandler(io, socket) {
         content: safeContent || null,
         file_reference_id: file_reference_id || null,
         file_name: file_name || null,
-        file_type: file_type || null,
+        file_type: file_type ? String(file_type).slice(0, 255) : null,
         file_size_bytes: file_size_bytes || null,
         reply_to_message_id: reply_to_message_id || null,
         forwarded_from_id: forwarded_from_id || null,
