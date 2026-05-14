@@ -183,13 +183,16 @@ function initSocket(server) {
         });
         const visibleUserIds = [...new Set(peerRows.map((p) => p.user_id))];
         const onlineUserIds = await getOnlineUsers(orgId, visibleUserIds);
+        const visibleNums = visibleUserIds.map((id) => Number(id));
         socket.emit("presence:snapshot", {
           online_user_ids: onlineUserIds.map((id) => Number(id)),
+          visible_user_ids: visibleNums,
           is_full_snapshot: false,
         });
       } else {
         socket.emit("presence:snapshot", {
           online_user_ids: [Number(userId)],
+          visible_user_ids: [Number(userId)],
           is_full_snapshot: false,
         });
       }
@@ -255,13 +258,16 @@ function initSocket(server) {
           });
           const visibleUserIds = [...new Set(peerRows.map((p) => p.user_id))];
           const onlineUserIds = await getOnlineUsers(orgId, visibleUserIds);
+          const visibleNums = visibleUserIds.map((id) => Number(id));
           socket.emit("presence:snapshot", {
             online_user_ids: onlineUserIds.map((id) => Number(id)),
+            visible_user_ids: visibleNums,
             is_full_snapshot: false,
           });
         } else {
           socket.emit("presence:snapshot", {
             online_user_ids: [Number(userId)],
+            visible_user_ids: [Number(userId)],
             is_full_snapshot: false,
           });
         }

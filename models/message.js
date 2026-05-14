@@ -48,7 +48,7 @@ const Message = sequelizeWrite.define('Message', {
     allowNull: true,
   },
   file_type: {
-    type: DataTypes.STRING(50),
+    type: DataTypes.STRING(255),
     allowNull: true,
   },
   file_size_bytes: {
