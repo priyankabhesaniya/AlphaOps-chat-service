@@ -95,4 +95,38 @@ async function getOrgUserIdsFromDb(orgId) {
   }
 }
 
-module.exports = { getUsersFromDb, getOrgUserIdsFromDb };
+async function searchUsersByName(query, orgId = null) {
+  if (!query) return {};
+  try {
+    const db = await getAuthSequelize();
+    const orgFilter = orgId ? " AND u.org_id = :orgId" : "";
+    const q = `%${query}%`;
+    const rows = await db.query(
+      `SELECT u.id, u.username, u.first_name, u.last_name
+       FROM users u
+       WHERE u.is_deleted = 0${orgFilter}
+         AND (
+           u.username LIKE :q OR
+           u.first_name LIKE :q OR
+           u.last_name LIKE :q OR
+           CONCAT(u.first_name, ' ', u.last_name) LIKE :q
+         )
+       LIMIT 100`,
+      {
+        replacements: { q, orgId: orgId || undefined },
+        type: Sequelize.QueryTypes.SELECT,
+      }
+    );
+    const map = {};
+    for (const r of rows) {
+      const name = [r.first_name, r.last_name].filter(Boolean).join(" ") || r.username;
+      map[r.id] = { id: r.id, name };
+    }
+    return map;
+  } catch (err) {
+    console.error("searchUsersByName error:", err.message);
+    return {};
+  }
+}
+
+module.exports = { getUsersFromDb, getOrgUserIdsFromDb, searchUsersByName };
