@@ -17,6 +17,7 @@ const { sequelizeWrite, sequelizeRead } = require('../config/database');
 // Associations
 Conversation.hasMany(ConversationParticipant, { foreignKey: 'conversation_id', as: 'participants' });
 ConversationParticipant.belongsTo(Conversation, { foreignKey: 'conversation_id', as: 'conversation' });
+ConversationParticipant.belongsTo(UserCache, { foreignKey: 'user_id', targetKey: 'user_id', as: 'user' });
 
 Conversation.hasMany(Message, { foreignKey: 'conversation_id', as: 'messages' });
 Message.belongsTo(Conversation, { foreignKey: 'conversation_id', as: 'conversation' });

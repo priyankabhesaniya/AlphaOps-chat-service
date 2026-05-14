@@ -3,6 +3,7 @@ const {
   ConversationParticipant,
   ConversationActivityLog,
   Message,
+  UserCache,
 } = require("../models");
 const { sendResponse } = require("../utils/responseUtils");
 const { invalidateParticipants, setParticipantIds, getCachedUsers, getOnlineUsers } = require("../redis/cacheService");
@@ -11,6 +12,7 @@ const { isConnected: isRedisConnected } = require("../redis/client");
 const { Op } = require("sequelize");
 const { sequelizeWrite } = require("../config/database");
 const { addMessageFanoutJob } = require("../jobs/queue");
+const { searchUsersByName } = require("../utils/getUsersFromDb");
 const { getUserSockets } = require("../socket/userSocketStore");
 const { getUsersFromDb, getOrgUserIdsFromDb } = require("../utils/getUsersFromDb");
 
@@ -215,25 +217,129 @@ async function leaveUsersFromConversationRoom(conversationId, userIds) {
 const getConversations = async (req, res) => {
   try {
     const { userId, org_id } = req.user;
-    const { page = 1, limit = 50 } = req.query;
-    const offset = (parseInt(page) - 1) * parseInt(limit);
+    const { cursor, limit = 25, query, tab, sort = "recent" } = req.query;
+    const queryLimit = parseInt(limit);
 
-    const participants = await ConversationParticipant.findAll({
-      where: {
-        user_id: userId,
-        org_id,
-        is_active: 1,
-        [Op.and]: [
-          // Sidebar: hide only while hidden_at is set (per-user soft delete / reopen).
-          // Message history cutoff stays on hidden_last_message_id in getMessages, not here.
-          sequelizeWrite.literal("`ConversationParticipant`.`hidden_at` IS NULL"),
-        ],
-      },
+    // Decode cursor
+    let cursorValues = null;
+    let offset = 0;
+    if (cursor) {
+      try {
+        cursorValues = JSON.parse(Buffer.from(cursor, "base64").toString("utf-8"));
+        if (cursorValues && typeof cursorValues.offset === "number") {
+          offset = cursorValues.offset;
+        }
+      } catch (e) {
+        console.error("Cursor decode error:", e);
+      }
+    }
+
+    // Filter by type
+    const conversationWhere = { is_deleted: 0 };
+    if (tab === "dm") conversationWhere.type = 1;
+    if (tab === "group") conversationWhere.type = 2;
+
+    // Search logic
+    let participantWhere = {
+      user_id: userId,
+      org_id,
+      is_active: 1,
+      [Op.and]: [
+         // Sidebar: hide only while hidden_at is set (per-user soft delete / reopen).
+         // Message history cutoff stays on hidden_last_message_id in getMessages, not here.
+         sequelizeWrite.literal("`ConversationParticipant`.`hidden_at` IS NULL"),
+      ],
+    };
+
+    if (query) {
+      const q = `%${query}%`;
+      // Search users in auth_db first
+      const matchingUsers = await searchUsersByName(query, org_id);
+      const matchingUserIds = Object.keys(matchingUsers);
+
+      const dmSearchCondition = matchingUserIds.length > 0
+        ? `OR (\`conversation\`.\`type\` = 1 AND EXISTS (
+            SELECT 1 FROM conversation_participants cp2
+            WHERE cp2.conversation_id = \`ConversationParticipant\`.\`conversation_id\`
+              AND cp2.user_id != ${userId}
+              AND cp2.user_id IN (${matchingUserIds.join(",")})
+          ))`
+        : "";
+
+      participantWhere[Op.and].push(
+        sequelizeWrite.literal(`(
+          (\`conversation\`.\`type\` = 2 AND \`conversation\`.\`title\` LIKE ${sequelizeWrite.escape(q)})
+          ${dmSearchCondition}
+        )`)
+      );
+    }
+
+    if (cursorValues && sort === "recent" && typeof cursorValues.is_favorite === "number") {
+      const { is_favorite, last_message_at, id } = cursorValues;
+      // Cursor logic for [is_favorite DESC, last_message_at DESC, id DESC]
+      // This is a simplified version of the logic
+      participantWhere[Op.and].push(
+        sequelizeWrite.literal(`(
+          \`ConversationParticipant\`.\`is_favorite\` < ${is_favorite}
+          OR (
+            \`ConversationParticipant\`.\`is_favorite\` = ${is_favorite} 
+            AND (
+              COALESCE(\`conversation\`.\`last_message_at\`, \`conversation\`.\`created_at\`) < ${sequelizeWrite.escape(last_message_at)}
+              OR (
+                COALESCE(\`conversation\`.\`last_message_at\`, \`conversation\`.\`created_at\`) = ${sequelizeWrite.escape(last_message_at)}
+                AND \`ConversationParticipant\`.\`conversation_id\` < ${id}
+              )
+            )
+          )
+        )`)
+      );
+    }
+
+    // Sorting logic
+    let order = [["is_favorite", "DESC"]];
+    if (sort === "a-z") {
+      order.push([
+        sequelizeWrite.literal(`CASE 
+          WHEN \`conversation\`.\`type\` = 2 THEN \`conversation\`.\`title\`
+          WHEN \`conversation\`.\`type\` = 1 THEN (
+            SELECT COALESCE(NULLIF(CONCAT(u.first_name, ' ', u.last_name), ' '), u.username)
+            FROM conversation_participants cp2
+            JOIN \`${process.env.AUTH_DB_NAME || "auth_db"}\`.\`users\` u ON cp2.user_id = u.id
+            WHERE cp2.conversation_id = \`ConversationParticipant\`.\`conversation_id\`
+              AND cp2.user_id != ${userId}
+            LIMIT 1
+          )
+          ELSE '' END`),
+        "ASC",
+      ]);
+    } else if (sort === "z-a") {
+      order.push([
+        sequelizeWrite.literal(`CASE 
+          WHEN \`conversation\`.\`type\` = 2 THEN \`conversation\`.\`title\`
+          WHEN \`conversation\`.\`type\` = 1 THEN (
+            SELECT COALESCE(NULLIF(CONCAT(u.first_name, ' ', u.last_name), ' '), u.username)
+            FROM conversation_participants cp2
+            JOIN \`${process.env.AUTH_DB_NAME || "auth_db"}\`.\`users\` u ON cp2.user_id = u.id
+            WHERE cp2.conversation_id = \`ConversationParticipant\`.\`conversation_id\`
+              AND cp2.user_id != ${userId}
+            LIMIT 1
+          )
+          ELSE '' END`),
+        "DESC",
+      ]);
+    } else {
+      // Default: recent (COALESCE handles new conversations without messages by using created_at)
+      order.push([sequelizeWrite.literal("COALESCE(`conversation`.`last_message_at`, `conversation`.`created_at`)"), "DESC"]);
+      order.push([{ model: Conversation, as: "conversation" }, "id", "DESC"]);
+    }
+
+    const { rows: participants, count: totalCount } = await ConversationParticipant.findAndCountAll({
+      where: participantWhere,
       include: [
         {
           model: Conversation,
           as: "conversation",
-          where: { is_deleted: 0 },
+          where: conversationWhere,
           attributes: [
             "id", "type", "title", "avatar_url", "group_type", "is_read_only",
             "allow_read_receipts",
@@ -254,15 +360,14 @@ const getConversations = async (req, res) => {
         "hidden_last_message_id",
         "hidden_at",
       ],
-      // Empty / draft threads have null last_message_at — use created_at so new DMs
-      // sort by recency and stay on page 1 instead of sinking below every chat with messages.
-      order: [
-        ["is_favorite", "DESC"],
-        [sequelizeWrite.literal("COALESCE(`conversation`.`last_message_at`, `conversation`.`created_at`)"), "DESC"],
-      ],
-      limit: parseInt(limit),
-      offset,
+      order,
+      limit: queryLimit + 1,
+      offset: sort === "recent" ? 0 : offset,
+      distinct: true,
     });
+
+    const hasMore = participants.length > queryLimit;
+    const resultParticipants = participants.slice(0, queryLimit);
 
     // Fetch unread counts from Redis. When a conversation has no Redis field yet,
     // fall back to DB unread_count (Redis restart / first load / keys evicted).
@@ -270,7 +375,7 @@ const getConversations = async (req, res) => {
     const unreadHash = redisAvailable ? await getUnreadHashRaw(userId) : null;
 
     // Get conversation IDs for participant counts + DM other-user resolution
-    const convIds = participants.map((p) => p.conversation_id);
+    const convIds = resultParticipants.map((p) => p.conversation_id);
 
     // Batch-fetch participant counts
     const countRows = await ConversationParticipant.findAll({
@@ -286,7 +391,7 @@ const getConversations = async (req, res) => {
     for (const r of countRows) countMap[r.conversation_id] = parseInt(r.count);
 
     // For DMs, find the other user in each DM conversation
-    const dmConvIds = participants
+    const dmConvIds = resultParticipants
       .filter((p) => p.conversation?.type === 1)
       .map((p) => p.conversation_id);
 
@@ -307,7 +412,7 @@ const getConversations = async (req, res) => {
     }
 
     // Collect all user IDs we need: senders + DM other users
-    const senderIds = participants
+    const senderIds = resultParticipants
       .map((p) => p.conversation?.last_message_sender_id)
       .filter(Boolean);
     const dmOtherUserIds = Object.values(dmOtherUserMap);
@@ -321,7 +426,7 @@ const getConversations = async (req, res) => {
       return { ...u, is_online: onlineSet.has(uid) };
     };
 
-    const conversations = participants.map((p) => {
+    const conversations = resultParticipants.map((p) => {
       const conv = p.conversation.toJSON();
       const participantCount = countMap[conv.id] || 0;
 
@@ -338,8 +443,6 @@ const getConversations = async (req, res) => {
       }
 
       // Prevent leaking pre-join or pre-hide history via preview fields.
-      // If the latest global last_message is not visible within this participant's window,
-      // return nulls for last message metadata for this user.
       const joinedAt = p.joined_at ? new Date(p.joined_at) : null;
       const hiddenLastMessageId =
         p.hidden_last_message_id != null && p.hidden_last_message_id !== ""
@@ -389,7 +492,32 @@ const getConversations = async (req, res) => {
       };
     });
 
-    sendResponse(res, 200, true, "Conversations fetched", { conversations });
+    let nextCursor = null;
+    if (hasMore && resultParticipants.length > 0) {
+      if (sort === "recent") {
+        const last = resultParticipants[resultParticipants.length - 1];
+        nextCursor = Buffer.from(
+          JSON.stringify({
+            is_favorite: last.is_favorite,
+            last_message_at: last.conversation.last_message_at || last.conversation.created_at,
+            id: last.conversation_id,
+          })
+        ).toString("base64");
+      } else {
+        nextCursor = Buffer.from(
+          JSON.stringify({
+            offset: offset + queryLimit,
+          })
+        ).toString("base64");
+      }
+    }
+
+    sendResponse(res, 200, true, "Conversations fetched", {
+      conversations,
+      next_cursor: nextCursor,
+      has_more: hasMore,
+      total_count: totalCount,
+    });
   } catch (error) {
     console.error("getConversations error:", error.message);
     sendResponse(res, 500, false, "Failed to fetch conversations");
